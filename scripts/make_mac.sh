@@ -82,7 +82,9 @@ case "$cxx_version" in
     *) fail "$CXX_BIN is not Apple clang ($cxx_version): install Xcode 16 or newer, or run 'xcode-select --install'" ;;
 esac
 apple_major="$(echo "$cxx_version" | sed -n 's/.*version \([0-9][0-9]*\).*/\1/p')"
-[ -n "$apple_major" ] && [ "$apple_major" -ge 16 ] || fail "Apple clang 16 or newer is needed ($cxx_version): install Xcode 16 or newer, or run 'xcode-select --install'"
+if [ -z "$apple_major" ] || [ "$apple_major" -lt 16 ]; then
+    fail "Apple clang 16 or newer is needed ($cxx_version): install Xcode 16 or newer, or run 'xcode-select --install'"
+fi
 
 missing=""
 command -v git > /dev/null 2>&1 || missing="$missing git"
@@ -154,7 +156,13 @@ if [ ! -x "$INSTALL/bin/rexglue" ] || [ "$MARKER" -nt "$INSTALL/bin/rexglue" ]; 
     if [ "$WITH_TESTS" -eq 1 ]; then configure_args="$configure_args -DREXGLUE_BUILD_TESTS=ON"; fi
     # shellcheck disable=SC2086 # configure_args is a list of -D options without spaces in values
     logged sdk-configure cmake --preset mac-arm64 $configure_args
-    host_cpu="$(grep '^CMAKE_HOST_SYSTEM_PROCESSOR:' out/build/mac-arm64/CMakeCache.txt | head -n 1 | sed 's/.*=//')"
+    # CMake does not cache the host processor; it writes it to CMakeSystem.cmake.
+    system_file=""
+    for f in out/build/mac-arm64/CMakeFiles/*/CMakeSystem.cmake; do
+        if [ -f "$f" ]; then system_file="$f"; break; fi
+    done
+    [ -n "$system_file" ] || fail "the SDK configure wrote no CMakeSystem.cmake (log: $LOGS/sdk-configure.log)"
+    host_cpu="$(sed -n 's/^set(CMAKE_HOST_SYSTEM_PROCESSOR "\(.*\)")$/\1/p' "$system_file" | head -n 1)"
     [ "$host_cpu" = "arm64" ] || fail "CMake saw the host as '$host_cpu', not arm64: it (or the shell) runs under Rosetta. Use a native Terminal and an Apple Silicon CMake, delete $SDK/out/build/mac-arm64 and run this again"
     jobs_args=""
     if [ -n "$JOBS" ]; then jobs_args="--parallel $JOBS"; fi
