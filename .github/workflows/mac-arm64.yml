@@ -201,7 +201,7 @@ jobs:
             -DREXGLUE_BUILD_TESTS=ON -DREXGLUE_ENABLE_TRACY=OFF
 
       - name: Build unit_tests
-        run: cmake --build "$TESTS_DIR" --config Release --target unit_tests --parallel
+        run: cmake --build "$TESTS_DIR" --config Release --target unit_tests --parallel -- -k 0
 
       # Everything except fiber tests must pass.
       - name: Unit tests (excluding fiber)
@@ -222,7 +222,7 @@ jobs:
       - name: Build ppc_tests (non-blocking, baseline)
         id: ppc_build
         continue-on-error: true
-        run: cmake --build "$TESTS_DIR" --config Release --target ppc_tests --parallel
+        run: cmake --build "$TESTS_DIR" --config Release --target ppc_tests --parallel -- -k 0
 
       - name: PPC tests (non-blocking, baseline)
         if: steps.ppc_build.outcome == 'success'
