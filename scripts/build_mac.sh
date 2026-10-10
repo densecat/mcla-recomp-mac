@@ -24,7 +24,9 @@ mkdir -p "$ROOT/out"
 # re-patched SDK needs --ignore-stamp.
 STAMP="$ROOT/out/.codegen-sdk-stamp"
 CODEGEN_ARGS=""
-if [ ! -e "$STAMP" ] || [ "$MARKER" -nt "$STAMP" ]; then CODEGEN_ARGS="--ignore-stamp"; fi
+if [ ! -e "$STAMP" ] || [ "$MARKER" -nt "$STAMP" ] || [ "$INSTALL/bin/rexglue" -nt "$STAMP" ]; then
+    CODEGEN_ARGS="--ignore-stamp"
+fi
 # shellcheck disable=SC2086 # CODEGEN_ARGS is empty or one flag
 if ! "$INSTALL/bin/rexglue" codegen $CODEGEN_ARGS mcla_manifest.toml > "$ROOT/out/codegen.log" 2>&1; then
     tail -n 20 "$ROOT/out/codegen.log"

@@ -34,7 +34,10 @@ check_one() {
         dep="${dep#"${dep%%[![:space:]]*}"}"
         dep="${dep%% (*}"
         case "$dep" in
-            /usr/lib/* | /System/* | @rpath/* | @loader_path/* | @executable_path/*) ;;
+            /usr/lib/* | /System/*) ;;
+            @rpath/* | @loader_path/* | @executable_path/*)
+                # Has to ship with it: some file of that name in the checked tree.
+                grep -qxF "${dep##*/}" "$names" || { deps_ok="NO (missing ${dep##*/})"; bad=1; } ;;
             *) deps_ok="NO ($dep)"; bad=1 ;;
         esac
     done < <(otool -L "$f" 2> /dev/null)
@@ -58,6 +61,10 @@ list_files() {
 for arg in "$@"; do
     [ -e "$arg" ] || { echo "no such file or folder: $arg" >&2; exit 1; }
 done
+
+names="$(mktemp)"
+trap 'rm -f "$names"' EXIT
+list_files "$@" | sed 's|.*/||' | sort -u > "$names"
 
 while IFS= read -r f; do
     case "$(file -b "$f")" in

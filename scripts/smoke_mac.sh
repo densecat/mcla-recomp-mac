@@ -85,7 +85,7 @@ done
 if [ "$exited" -eq 1 ]; then
     code=0
     wait "$pid" || code=$?
-    echo "process exited early after ${elapsed}s, code $code"
+    echo "FAILED: process exited early after ${elapsed}s, code $code"
 else
     kill -TERM "$pid" 2> /dev/null
     for _ in 1 2 3 4 5; do
@@ -102,4 +102,6 @@ echo "log: $LOG"
 if [ -f "$LOG" ]; then
     grep -iE 'null-page|unhandled|critical|unregistered|MapViewsMac' "$LOG" | head -n 20
 fi
+# The game is meant to run for the whole duration: stopping on its own is a failure.
+[ "$exited" -eq 0 ] || exit 1
 exit 0
