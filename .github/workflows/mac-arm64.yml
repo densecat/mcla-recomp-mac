@@ -5,11 +5,6 @@ name: mac-arm64
 
 on:
   workflow_dispatch:
-    inputs:
-      baseline:
-        description: "Baseline phase: the current patch is the baseline, so ppc_tests on arm64 are allowed to fail"
-        type: boolean
-        default: true
   push:
     paths:
       - "patches/**"
@@ -144,6 +139,9 @@ jobs:
 
   # Native Apple Silicon build via the project scripts.
   mac-arm64:
+    # Needs the PPC test binaries the Linux job assembles (the SDK's patched
+    # PowerPC binutils only run on Linux and Windows).
+    needs: linux-x86_64
     runs-on: macos-26
     timeout-minutes: 150
     env:
@@ -185,6 +183,13 @@ jobs:
           mkdir -p out/logs
           scripts/check_arm64.sh third_party/rexglue-sdk/out/install/mac-arm64 2>&1 | tee out/logs/arch-report.txt
 
+      # Assembled from the SDK's own tests/ppc/asm sources; host-independent.
+      - name: Download assembled PPC test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: ppc-test-bins
+          path: ppc-test-bins
+
       # Separate build dir (the script's build does not enable tests), same
       # flags as the mac-arm64 preset.
       - name: Configure tests
@@ -198,7 +203,8 @@ jobs:
             -DCMAKE_CXX_STANDARD=23 \
             -DCMAKE_CONFIGURATION_TYPES="Debug;Release;RelWithDebInfo" \
             -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
-            -DREXGLUE_BUILD_TESTS=ON -DREXGLUE_ENABLE_TRACY=OFF
+            -DREXGLUE_BUILD_TESTS=ON -DREXGLUE_ENABLE_TRACY=OFF \
+            -DREXGLUE_PPC_PREBUILT_DIR="$GITHUB_WORKSPACE/ppc-test-bins"
 
       - name: Build unit_tests
         run: cmake --build "$TESTS_DIR" --config Release --target unit_tests --parallel -- -k 0
@@ -208,25 +214,16 @@ jobs:
         working-directory: third_party/rexglue-sdk/out/build/mac-arm64-tests
         run: ctest -C Release -R '^unit\.' -E '[Ff]iber' --output-on-failure --output-junit "$GITHUB_WORKSPACE/out/logs/unit-junit.xml"
 
-      # Fiber failures are recorded as a warning, not a job failure.
-      - name: Unit tests (fiber only, non-blocking)
-        continue-on-error: true
+      # Run on their own so a fiber failure is easy to spot in the log.
+      - name: Unit tests (fiber)
         working-directory: third_party/rexglue-sdk/out/build/mac-arm64-tests
         run: ctest -C Release -R '^unit\..*[Ff]iber' --output-on-failure --output-junit "$GITHUB_WORKSPACE/out/logs/unit-fiber-junit.xml"
 
-      # Baseline phase: ppc_tests cannot build on arm64 yet (unconditional
-      # -msse4.1 in tests/ppc/CMakeLists.txt, and the bundled binutils cannot
-      # run on macOS). Non-blocking for every run in this phase. Phase 2 will
-      # pass REXGLUE_PPC_PREBUILT_DIR pointing at the ppc-test-bins artifact
-      # and drop continue-on-error.
-      - name: Build ppc_tests (non-blocking, baseline)
-        id: ppc_build
-        continue-on-error: true
+      # The PowerPC instruction tests, recompiled and run natively on arm64.
+      - name: Build ppc_tests
         run: cmake --build "$TESTS_DIR" --config Release --target ppc_tests --parallel -- -k 0
 
-      - name: PPC tests (non-blocking, baseline)
-        if: steps.ppc_build.outcome == 'success'
-        continue-on-error: true
+      - name: PPC tests
         working-directory: third_party/rexglue-sdk/out/build/mac-arm64-tests
         run: ctest -C Release -R '^ppc\.' --output-on-failure --output-junit "$GITHUB_WORKSPACE/out/logs/ppc-junit.xml"
 

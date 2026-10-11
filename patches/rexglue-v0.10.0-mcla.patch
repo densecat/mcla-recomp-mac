@@ -36,6 +36,75 @@ index 9b3cdf5..af378d8 100644
  else()
      # When consumed via add_subdirectory(), provide the same interface as find_package().
      # This sets REXGLUE_SHARE_DIR and makes rexglue_configure_target() available.
+diff --git a/cmake/ppc_test_pipeline.cmake b/cmake/ppc_test_pipeline.cmake
+index 59d01ee..f2860a3 100644
+--- a/cmake/ppc_test_pipeline.cmake
++++ b/cmake/ppc_test_pipeline.cmake
+@@ -3,6 +3,12 @@
+ # Provides ppc_add_test_binary() for assembling, linking, and generating
+ # symbol maps from PPC assembly test files.
+ 
++# Optional directory holding prebuilt <name>.bin/<name>.map for every tests/ppc/asm/*.s.
++# When set, the bundled binutils are not needed (e.g. hosts without a runnable
++# powerpc-none-elf toolchain) and the as/ld/nm steps are skipped.
++set(REXGLUE_PPC_PREBUILT_DIR "" CACHE PATH
++    "Directory with prebuilt PPC test .bin/.map files; skips assembling when set")
++
+ # Locate PPC toolchain in tools/ directory
+ set(PPC_TOOLS_DIR "${PROJECT_SOURCE_DIR}/tools/binutils")
+ 
+@@ -17,15 +23,19 @@ else()
+ endif()
+ 
+ # Verify toolchain exists
+-if(NOT EXISTS "${PPC_ASSEMBLER}")
+-    message(FATAL_ERROR "PPC assembler not found at ${PPC_ASSEMBLER}")
+-endif()
+-if(NOT EXISTS "${PPC_LINKER}")
+-    message(FATAL_ERROR "PPC linker not found at ${PPC_LINKER}")
+-endif()
++if(REXGLUE_PPC_PREBUILT_DIR)
++    message(STATUS "PowerPC test binaries: prebuilt in ${REXGLUE_PPC_PREBUILT_DIR}")
++else()
++    if(NOT EXISTS "${PPC_ASSEMBLER}")
++        message(FATAL_ERROR "PPC assembler not found at ${PPC_ASSEMBLER}")
++    endif()
++    if(NOT EXISTS "${PPC_LINKER}")
++        message(FATAL_ERROR "PPC linker not found at ${PPC_LINKER}")
++    endif()
+ 
+-message(STATUS "PowerPC assembler: ${PPC_ASSEMBLER}")
+-message(STATUS "PowerPC linker: ${PPC_LINKER}")
++    message(STATUS "PowerPC assembler: ${PPC_ASSEMBLER}")
++    message(STATUS "PowerPC linker: ${PPC_LINKER}")
++endif()
+ 
+ # Convert Windows paths to Cygwin paths for binutils (Windows only)
+ function(_ppc_convert_to_cygwin_path WINDOWS_PATH OUTPUT_VAR)
+@@ -45,9 +55,23 @@ endfunction()
+ # Assembles .s -> .o, links .o -> .bin, generates .o -> .map.
+ # Appends output files to PPC_TEST_BINS, PPC_TEST_MAPS, PPC_TEST_OBJS
+ # global properties.
++# With REXGLUE_PPC_PREBUILT_DIR set, only records the prebuilt .bin/.map files.
+ function(ppc_add_test_binary ASM_FILE OBJ_DIR BIN_DIR)
+     get_filename_component(BASE_NAME ${ASM_FILE} NAME_WE)
+ 
++    if(REXGLUE_PPC_PREBUILT_DIR)
++        set(BIN_FILE ${REXGLUE_PPC_PREBUILT_DIR}/${BASE_NAME}.bin)
++        set(MAP_FILE ${REXGLUE_PPC_PREBUILT_DIR}/${BASE_NAME}.map)
++        foreach(PREBUILT_FILE ${BIN_FILE} ${MAP_FILE})
++            if(NOT EXISTS "${PREBUILT_FILE}")
++                message(FATAL_ERROR "Prebuilt PPC test file missing: ${PREBUILT_FILE}")
++            endif()
++        endforeach()
++        set_property(GLOBAL APPEND PROPERTY PPC_TEST_BINS ${BIN_FILE})
++        set_property(GLOBAL APPEND PROPERTY PPC_TEST_MAPS ${MAP_FILE})
++        return()
++    endif()
++
+     set(OBJ_FILE ${OBJ_DIR}/${BASE_NAME}.o)
+     set(BIN_FILE ${BIN_DIR}/${BASE_NAME}.bin)
+     set(MAP_FILE ${BIN_DIR}/${BASE_NAME}.map)
 diff --git a/include/rex/chrono/chrono.h b/include/rex/chrono/chrono.h
 index d876846..500ee36 100644
 --- a/include/rex/chrono/chrono.h
@@ -53,7 +122,7 @@ index d876846..500ee36 100644
  struct clock_time_conversion {};
  
 diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
-index 4d85a2b..de3fa66 100644
+index 4d85a2b..370db1a 100644
 --- a/include/rex/graphics/shared_memory.h
 +++ b/include/rex/graphics/shared_memory.h
 @@ -140,6 +140,14 @@ class SharedMemory {
@@ -83,7 +152,7 @@ index 4d85a2b..de3fa66 100644
  
    // Mutex between the guest memory subsystem and the command processor, to be
    // locked when checking or updating validity of pages/ranges and when firing
-@@ -176,6 +189,25 @@ class SharedMemory {
+@@ -176,6 +189,31 @@ class SharedMemory {
    std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
    uint32_t num_system_page_flags_ = 0;
  
@@ -97,11 +166,17 @@ index 4d85a2b..de3fa66 100644
 +  std::vector<uint32_t> page_hot_until_ms_;
 +  uint32_t page_heat_decay_ms_ = 0;
 +  uint32_t page_hot_latest_until_ms_ = 0;
++  // Deadlines are compared with wrapping 32-bit arithmetic, which on its own
++  // reads a zero (never set) deadline as hot once the uptime passes 2^31 ms. So
++  // 0 means not hot, and a real deadline is never stored as 0.
++  static bool HotDeadlineActive(uint32_t until_ms, uint32_t now_ms) {
++    return until_ms != 0 && int32_t(until_ms - now_ms) > 0;
++  }
 +  bool AnyPageHot(uint32_t now_ms) const {
-+    return int32_t(page_hot_latest_until_ms_ - now_ms) > 0;
++    return HotDeadlineActive(page_hot_latest_until_ms_, now_ms);
 +  }
 +  bool IsPageHot(uint32_t page, uint32_t now_ms) const {
-+    return int32_t(page_hot_until_ms_[page] - now_ms) > 0;
++    return HotDeadlineActive(page_hot_until_ms_[page], now_ms);
 +  }
 +  // Bit n set if page (block * 64 + n) is hot.
 +  uint64_t HotPageMask(uint32_t block, uint32_t now_ms) const;
@@ -202,6 +277,74 @@ index e3fc40d..1168402 100644
  #else
  #error No library names provided for the target platform.
  #endif
+diff --git a/include/rex/platform/fpscr.h b/include/rex/platform/fpscr.h
+index c2c4fd4..f2f8253 100644
+--- a/include/rex/platform/fpscr.h
++++ b/include/rex/platform/fpscr.h
+@@ -38,8 +38,11 @@ struct FPSCRPlatform {
+                                        (1 << 10) |  // OM - Overflow
+                                        (1 << 11) |  // UM - Underflow
+                                        (1 << 12);   // PM - Precision (Inexact)
++  // Guest RN 0..3: nearest, zero, +infinity, -infinity
+   static constexpr size_t GuestToHost[] = {SIMDE_MM_ROUND_NEAREST, SIMDE_MM_ROUND_TOWARD_ZERO,
+                                            SIMDE_MM_ROUND_UP, SIMDE_MM_ROUND_DOWN};
++  // Host MXCSR RC 0..3 (nearest, -infinity, +infinity, zero) to guest RN
++  static constexpr size_t HostToGuest[] = {0, 3, 2, 1};
+ 
+   static inline u32 getcsr() noexcept { return simde_mm_getcsr(); }
+ 
+@@ -58,9 +61,11 @@ struct FPSCRPlatform {
+   static constexpr size_t RoundMaskVal = 3 << RoundShift;
+   // FZ and FZ16
+   static constexpr size_t FlushMask = (1 << 19) | (1 << 24);
+-  // Nearest, Zero, -Infinity, -Infinity
++  // Guest RN 0..3: nearest, zero, +infinity, -infinity
+   static constexpr size_t GuestToHost[] = {0 << RoundShift, 3 << RoundShift, 1 << RoundShift,
+                                            2 << RoundShift};
++  // Host FPCR RMode 0..3 (nearest, +infinity, -infinity, zero) to guest RN
++  static constexpr size_t HostToGuest[] = {0, 2, 3, 1};
+   // Exception enable bits (0 = exception disabled, ARM defaults to 0)
+   static constexpr u32 ExceptionMask = (1 << 8) |   // IOE - Invalid Operation
+                                        (1 << 9) |   // DZE - Division by Zero
+@@ -71,11 +76,14 @@ struct FPSCRPlatform {
+ 
+   static inline u32 getcsr() noexcept {
+     u64 csr;
+-    __asm__ __volatile__("mrs %0, fpcr" : "=r"(csr));
++    __asm__ __volatile__("mrs %0, fpcr" : "=r"(csr) : : "memory");
+     return csr;
+   }
+ 
+-  static inline void setcsr(u32 csr) noexcept { __asm__ __volatile__("msr fpcr, %0" : : "r"(csr)); }
++  static inline void setcsr(u32 csr) noexcept {
++    u64 value = csr;
++    __asm__ __volatile__("msr fpcr, %0" : : "r"(value) : "memory");
++  }
+ 
+   static inline void InitHostExceptions(u32& csr) noexcept {
+     csr &= ~ExceptionMask;  // Clear enable bits to disable exceptions
+diff --git a/include/rex/ppc/context.h b/include/rex/ppc/context.h
+index 0ede542..c2ff3ee 100644
+--- a/include/rex/ppc/context.h
++++ b/include/rex/ppc/context.h
+@@ -147,8 +147,6 @@ constexpr uint32_t kRoundMask = 0x03;
+ struct FPSCRRegister {
+   uint32_t csr;
+ 
+-  static constexpr size_t HostToGuest[] = {kRoundNearest, kRoundDown, kRoundUp, kRoundTowardZero};
+-
+   using Platform = platform::FPSCRPlatform;
+   static constexpr size_t RoundShift = Platform::RoundShift;
+   static constexpr size_t RoundMaskVal = Platform::RoundMaskVal;
+@@ -168,7 +166,7 @@ struct FPSCRRegister {
+ 
+   inline uint32_t loadFromHost() noexcept {
+     csr = getcsr();
+-    return HostToGuest[(csr & RoundMaskVal) >> RoundShift];
++    return Platform::HostToGuest[(csr & RoundMaskVal) >> RoundShift];
+   }
+ 
+   inline void storeFromGuest(uint32_t value) noexcept {
 diff --git a/include/rex/string/numeric.h b/include/rex/string/numeric.h
 index 85994c7..eec442c 100644
 --- a/include/rex/string/numeric.h
@@ -449,7 +592,7 @@ index 4edde2b..81f8d34 100644
      bool ext_KHR_xcb_surface = false;  // #6
  #endif
 diff --git a/resources/templates/codegen/pch_h.inja b/resources/templates/codegen/pch_h.inja
-index 68274d2..b10adf9 100644
+index 68274d2..025f1b0 100644
 --- a/resources/templates/codegen/pch_h.inja
 +++ b/resources/templates/codegen/pch_h.inja
 @@ -124,7 +124,7 @@ extern PPCFuncMapping PPCFuncMappings[];
@@ -461,8 +604,41 @@ index 68274d2..b10adf9 100644
  #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
  #else
  #define REX_PHYS_HOST_OFFSET(addr) 0u
+@@ -146,6 +146,32 @@ extern PPCFuncMapping PPCFuncMappings[];
+ 
+ #define REX_MEMORY_SIZE 0x100000000ull
+ 
++//=============================================================================
++// Guest Memory Barriers
++//=============================================================================
++
++// Xbox 360 sync/lwsync/eieio/isync. x86 is strongly ordered, so only arm64 needs hardware
++// barriers (guest threads can run on any core). Define REX_GUEST_BARRIERS=0 to disable.
++#ifndef REX_GUEST_BARRIERS
++#if REX_ARCH_ARM64
++#define REX_GUEST_BARRIERS 1
++#else
++#define REX_GUEST_BARRIERS 0
++#endif
++#endif
++
++#if REX_GUEST_BARRIERS && REX_ARCH_ARM64
++#define REX_SYNC() __asm__ __volatile__("dmb ish" ::: "memory")
++#define REX_LWSYNC() __asm__ __volatile__("dmb ish" ::: "memory")
++#define REX_EIEIO() __asm__ __volatile__("dmb ish" ::: "memory")
++#define REX_ISYNC() __asm__ __volatile__("isb" ::: "memory")
++#else
++#define REX_SYNC() ((void)0)
++#define REX_LWSYNC() ((void)0)
++#define REX_EIEIO() ((void)0)
++#define REX_ISYNC() __asm__ __volatile__("" ::: "memory")
++#endif
++
+ //=============================================================================
+ // MMIO
+ //=============================================================================
 diff --git a/resources/templates/test/ppc_config_h.inja b/resources/templates/test/ppc_config_h.inja
-index 0c334f8..4d278ba 100644
+index 0c334f8..3b04430 100644
 --- a/resources/templates/test/ppc_config_h.inja
 +++ b/resources/templates/test/ppc_config_h.inja
 @@ -73,7 +73,7 @@
@@ -474,6 +650,134 @@ index 0c334f8..4d278ba 100644
  #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
  #else
  #define REX_PHYS_HOST_OFFSET(addr) 0u
+@@ -95,6 +95,32 @@
+ 
+ #define REX_MEMORY_SIZE 0x100000000ull
+ 
++//=============================================================================
++// Guest Memory Barriers
++//=============================================================================
++
++// Xbox 360 sync/lwsync/eieio/isync. x86 is strongly ordered, so only arm64 needs hardware
++// barriers (guest threads can run on any core). Define REX_GUEST_BARRIERS=0 to disable.
++#ifndef REX_GUEST_BARRIERS
++#if REX_ARCH_ARM64
++#define REX_GUEST_BARRIERS 1
++#else
++#define REX_GUEST_BARRIERS 0
++#endif
++#endif
++
++#if REX_GUEST_BARRIERS && REX_ARCH_ARM64
++#define REX_SYNC() __asm__ __volatile__("dmb ish" ::: "memory")
++#define REX_LWSYNC() __asm__ __volatile__("dmb ish" ::: "memory")
++#define REX_EIEIO() __asm__ __volatile__("dmb ish" ::: "memory")
++#define REX_ISYNC() __asm__ __volatile__("isb" ::: "memory")
++#else
++#define REX_SYNC() ((void)0)
++#define REX_LWSYNC() ((void)0)
++#define REX_EIEIO() ((void)0)
++#define REX_ISYNC() __asm__ __volatile__("" ::: "memory")
++#endif
++
+ //=============================================================================
+ // Function Dispatch
+ //=============================================================================
+diff --git a/src/codegen/builders.h b/src/codegen/builders.h
+index 24894f2..984475c 100644
+--- a/src/codegen/builders.h
++++ b/src/codegen/builders.h
+@@ -383,6 +383,8 @@ bool build_attn(BuilderContext& ctx);
+ bool build_sync(BuilderContext& ctx);
+ bool build_lwsync(BuilderContext& ctx);
+ bool build_eieio(BuilderContext& ctx);
++bool build_isync(BuilderContext& ctx);
++bool build_ptesync(BuilderContext& ctx);
+ bool build_db16cyc(BuilderContext& ctx);
+ bool build_cctpl(BuilderContext& ctx);
+ bool build_cctpm(BuilderContext& ctx);
+diff --git a/src/codegen/builders/helpers.h b/src/codegen/builders/helpers.h
+index dbc8d51..0e9b94a 100644
+--- a/src/codegen/builders/helpers.h
++++ b/src/codegen/builders/helpers.h
+@@ -280,8 +280,8 @@ inline void emitAtomicLoadReserve(BuilderContext& ctx, const char* ptr_type, con
+   if (ctx.insn.operands[1] != 0)
+     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
+   ctx.println("{}.u32;", ctx.r(ctx.insn.operands[2]));
+-  ctx.println("\t{}.{} = *({}*)REX_RAW_ADDR({});", ctx.reserved(), reserved_field, ptr_type,
+-              ctx.ea());
++  ctx.println("\t{}.{} = *(volatile {}*)REX_RAW_ADDR({});", ctx.reserved(), reserved_field,
++              ptr_type, ctx.ea());
+   ctx.println("\t{}.u64 = {}({}.{});", ctx.r(ctx.insn.operands[0]), bswap_func, ctx.reserved(),
+               reserved_field);
+ }
+diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
+index b2d70f5..966d1d0 100644
+--- a/src/codegen/builders/system.cpp
++++ b/src/codegen/builders/system.cpp
+@@ -31,20 +31,32 @@ bool build_attn(BuilderContext& ctx) {
+ }
+ 
+ bool build_sync(BuilderContext& ctx) {
+-  // Memory barrier, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  // Full memory barrier, REX_SYNC() is a hardware barrier on weakly ordered hosts (see pch.h)
++  ctx.println("\tREX_SYNC();");
+   return true;
+ }
+ 
+ bool build_lwsync(BuilderContext& ctx) {
+-  // Lightweight memory barrier, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  // Lightweight memory barrier, mapped to the same host barrier as sync
++  ctx.println("\tREX_LWSYNC();");
+   return true;
+ }
+ 
+ bool build_eieio(BuilderContext& ctx) {
+-  // Enforce in-order execution of I/O, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  // Enforce in-order execution of I/O, mapped to the same host barrier as sync
++  ctx.println("\tREX_EIEIO();");
++  return true;
++}
++
++bool build_isync(BuilderContext& ctx) {
++  // Instruction synchronize, compiler barrier plus instruction barrier on weakly ordered hosts
++  ctx.println("\tREX_ISYNC();");
++  return true;
++}
++
++bool build_ptesync(BuilderContext& ctx) {
++  // Page table entry synchronize (sync 2), treated as a full memory barrier
++  ctx.println("\tREX_SYNC();");
+   return true;
+ }
+ 
+@@ -339,8 +351,8 @@ bool build_mtfsf(BuilderContext& ctx) {
+   uint32_t fm = ctx.insn.operands[0];
+   uint32_t mask = 0;
+   for (int j = 0; j < 8; j++) {
+-    if (fm & (1 << (7 - j)))
+-      mask |= 0xF << (4 * j);
++    if (fm & (0x80 >> j))
++      mask |= 0xF << (4 * (7 - j));
+   }
+   if (mask == 0xFFFFFFFF) {
+     ctx.println("\tctx.fpscr.storeFromGuest({}.u32);", ctx.f(ctx.insn.operands[1]));
+diff --git a/src/codegen/instruction_dispatch.cpp b/src/codegen/instruction_dispatch.cpp
+index 40ae269..14c872e 100644
+--- a/src/codegen/instruction_dispatch.cpp
++++ b/src/codegen/instruction_dispatch.cpp
+@@ -319,6 +319,8 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
+       {PPC_INST_SYNC, build_sync},
+       {PPC_INST_LWSYNC, build_lwsync},
+       {PPC_INST_EIEIO, build_eieio},
++      {PPC_INST_ISYNC, build_isync},
++      {PPC_INST_PTESYNC, build_ptesync},
+       {PPC_INST_DB16CYC, build_db16cyc},
+       {PPC_INST_CCTPL, build_cctpl},
+       {PPC_INST_CCTPM, build_cctpm},
 diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
 index 1ddafd0..3e873dc 100644
 --- a/src/core/CMakeLists.txt
@@ -583,6 +887,138 @@ index fcfd6c9..7ac7790 100644
  
  #include <dlfcn.h>
  
+diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
+index 8b1c76a..efabf67 100644
+--- a/src/core/exception_handler_posix.cpp
++++ b/src/core/exception_handler_posix.cpp
+@@ -23,6 +23,12 @@
+ 
+ #include <cstdint>
+ #include <cstring>
++#if REX_PLATFORM_MAC
++#include <pthread.h>
++#include <unistd.h>
++
++#include <cerrno>
++#endif
+ 
+ #include <rex/assert.h>
+ #include <rex/logging.h>
+@@ -49,6 +55,98 @@ constexpr size_t kMaxHandlerCount = 8;
+ // Executed in order.
+ std::pair<ExceptionHandler::Handler, void*> handlers_[kMaxHandlerCount];
+ 
++#if REX_PLATFORM_MAC
++// These helpers run in a signal handler: only write(2), sigaction and a fixed
++// stack buffer, no locks, allocation or stdio.
++static void AppendString(char*& out, const char* string) {
++  while (*string) {
++    *out++ = *string++;
++  }
++}
++
++static void AppendHex(char*& out, uint64_t value) {
++  static const char kDigits[] = "0123456789abcdef";
++  *out++ = '0';
++  *out++ = 'x';
++  bool started = false;
++  for (int shift = 60; shift >= 0; shift -= 4) {
++    const unsigned digit = unsigned(value >> shift) & 0xF;
++    if (digit || started || !shift) {
++      *out++ = kDigits[digit];
++      started = true;
++    }
++  }
++}
++
++static void AppendDecimal(char*& out, unsigned value) {
++  char digits[10];
++  size_t count = 0;
++  do {
++    digits[count++] = char('0' + value % 10);
++    value /= 10;
++  } while (value);
++  while (count) {
++    *out++ = digits[--count];
++  }
++}
++
++// No registered handler claimed the fault. Returning would re-execute the
++// faulting instruction forever (a real crash turns into a 100% CPU hang), so
++// pass it on to the handler that was installed before ours: the SEH one, which
++// throws inside a guest SEH_TRY and otherwise resets the signal to SIG_DFL and
++// re-raises. Only macOS does this, as it is the only target this was tested on;
++// the other POSIX targets keep returning as before.
++static void ChainUnhandledFault(int signal_number, siginfo_t* signal_info, void* signal_context,
++                                uint64_t pc) {
++  const int saved_errno = errno;
++  char line[160];
++  char* out = line;
++  AppendString(out, "rex: unhandled fault, signal ");
++  AppendDecimal(out, unsigned(signal_number));
++  AppendString(out, " addr ");
++  AppendHex(out, signal_info ? uint64_t(reinterpret_cast<uintptr_t>(signal_info->si_addr)) : 0);
++  AppendString(out, " pc ");
++  AppendHex(out, pc);
++  *out++ = '\n';
++  ssize_t written = write(STDERR_FILENO, line, size_t(out - line));
++  (void)written;
++  errno = saved_errno;
++
++  const struct sigaction* original = signal_number == SIGILL    ? &original_sigill_handler_
++                                     : signal_number == SIGBUS ? &original_sigbus_handler_
++                                                               : &original_sigsegv_handler_;
++  const bool has_siginfo_handler = (original->sa_flags & SA_SIGINFO) != 0;
++  const bool original_usable = has_siginfo_handler
++                                   ? original->sa_sigaction != nullptr
++                                   : (original->sa_handler != SIG_DFL &&
++                                      original->sa_handler != SIG_IGN &&
++                                      original->sa_handler != nullptr);
++  if (original_usable) {
++    // This handler runs with its signal blocked (no SA_NODEFER). The SEH
++    // handler throws out of it for a guest SEH_TRY, which skips the sigreturn
++    // that would unblock the signal again and the next fault on this thread
++    // would then be fatal, so unblock it now.
++    sigset_t unblock_set;
++    sigemptyset(&unblock_set);
++    sigaddset(&unblock_set, signal_number);
++    pthread_sigmask(SIG_UNBLOCK, &unblock_set, nullptr);
++    if (has_siginfo_handler) {
++      original->sa_sigaction(signal_number, signal_info, signal_context);
++    } else {
++      original->sa_handler(signal_number);
++    }
++  }
++  // Still here: the original handler returned, or there was none to call. The
++  // faulting instruction would run into the same fault again, so make that
++  // take the default action instead.
++  struct sigaction default_action;
++  std::memset(&default_action, 0, sizeof(default_action));
++  default_action.sa_handler = SIG_DFL;
++  sigemptyset(&default_action.sa_mask);
++  sigaction(signal_number, &default_action, nullptr);
++}
++#endif  // REX_PLATFORM_MAC
++
+ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+                                      void* signal_context) {
+ #if REX_PLATFORM_MAC
+@@ -417,6 +515,15 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+       return;
+     }
+   }
++
++#if REX_PLATFORM_MAC
++#if REX_ARCH_AMD64
++  const uint64_t fault_pc = thread_context.rip;
++#else
++  const uint64_t fault_pc = thread_context.pc;
++#endif
++  ChainUnhandledFault(signal_number, signal_info, signal_context, fault_pc);
++#endif  // REX_PLATFORM_MAC
+ }
+ 
+ void ExceptionHandler::Install(Handler fn, void* data) {
 diff --git a/src/core/exception_handler_ps5.cpp b/src/core/exception_handler_ps5.cpp
 new file mode 100644
 index 0000000..86e8984
@@ -1218,10 +1654,10 @@ index b4b885a..19ace70 100644
  #include <sys/ioctl.h>
  #include <unistd.h>
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15..a656a20 100644
+index 9ac8d15..c294801 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
-@@ -9,7 +9,7 @@
+@@ -9,10 +9,11 @@
  #include <rex/platform.h>
  #include <rex/thread.h>
  
@@ -1230,7 +1666,11 @@ index 9ac8d15..a656a20 100644
  
  #include <signal.h>
  
-@@ -23,6 +23,9 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
++#include <algorithm>
+ #include <atomic>
+ #include <array>
+ #include <cerrno>
+@@ -23,6 +24,9 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
  #include <memory>
  
  #include <pthread.h>
@@ -1240,7 +1680,7 @@ index 9ac8d15..a656a20 100644
  #include <semaphore.h>
  
  #if defined(__APPLE__)
-@@ -115,7 +118,7 @@ enum class SignalType {
+@@ -115,7 +119,7 @@ enum class SignalType {
  };
  
  int GetSystemSignal(SignalType num) {
@@ -1249,7 +1689,7 @@ index 9ac8d15..a656a20 100644
    // macOS has no realtime signals (SIGRTMIN..SIGRTMAX); map the runtime's
    // signals onto the two user-defined signals.
    switch (num) {
-@@ -135,7 +138,7 @@ int GetSystemSignal(SignalType num) {
+@@ -135,7 +139,7 @@ int GetSystemSignal(SignalType num) {
  }
  
  SignalType GetSystemSignalType(int num) {
@@ -1258,7 +1698,7 @@ index 9ac8d15..a656a20 100644
    switch (num) {
      case SIGUSR1:
        return SignalType::kThreadSuspend;
-@@ -178,6 +181,8 @@ void EnableAffinityConfiguration() {}
+@@ -178,6 +182,8 @@ void EnableAffinityConfiguration() {}
  uint32_t current_thread_system_id() {
  #if defined(__APPLE__)
    return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
@@ -1267,7 +1707,7 @@ index 9ac8d15..a656a20 100644
  #else
    return static_cast<uint32_t>(syscall(SYS_gettid));
  #endif
-@@ -621,6 +626,96 @@ struct ThreadStartData {
+@@ -621,6 +627,96 @@ struct ThreadStartData {
    Thread* thread_obj;
  };
  
@@ -1364,7 +1804,7 @@ index 9ac8d15..a656a20 100644
  template <>
  class PosixCondition<Thread> : public PosixConditionBase {
    enum class State {
-@@ -651,6 +746,14 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -651,6 +747,14 @@ class PosixCondition<Thread> : public PosixConditionBase {
      pthread_attr_t attr;
      if (pthread_attr_init(&attr) != 0)
        return false;
@@ -1379,7 +1819,7 @@ index 9ac8d15..a656a20 100644
      if (pthread_attr_setstacksize(&attr, params.stack_size) != 0) {
        pthread_attr_destroy(&attr);
        return false;
-@@ -697,6 +800,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -697,6 +801,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
      // Match Canary/Edge behavior.
      // Force-cancel/join from the condition destructor can self-join/crash
      // depending on shutdown ordering, so threads must be stopped explicitly.
@@ -1391,7 +1831,7 @@ index 9ac8d15..a656a20 100644
    }
  
    bool Signal() override { return true; }
-@@ -718,6 +826,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -718,6 +827,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
          std::lock_guard<std::mutex> lock(android_pre_api_26_name_mutex_);
          rex::string::copy_truncating(result.data(), android_pre_api_26_name_, result.size());
        }
@@ -1400,7 +1840,7 @@ index 9ac8d15..a656a20 100644
  #else
        if (pthread_getname_np(thread_, result.data(), result.size() - 1) != 0) {
          assert_always();
-@@ -736,6 +846,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -736,6 +847,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
        if (pthread_equal(thread_, pthread_self())) {
          pthread_setname_np(std::string(name).c_str());
        }
@@ -1409,7 +1849,7 @@ index 9ac8d15..a656a20 100644
  #else
        pthread_setname_np(thread_, std::string(name).c_str());
  #endif
-@@ -758,13 +870,18 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -758,13 +871,18 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
  #if defined(__APPLE__)
    uint32_t system_id() const { return static_cast<uint32_t>(pthread_mach_thread_np(thread_)); }
@@ -1429,7 +1869,7 @@ index 9ac8d15..a656a20 100644
      // macOS doesn't expose Linux-style pthread affinity masks; report every
      // logical processor as available.
      auto cpu_count = std::min<uint32_t>(logical_processor_count(), 64);
-@@ -795,7 +912,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -795,7 +913,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
    void set_affinity_mask(uint64_t mask) {
      WaitStarted();
@@ -1438,7 +1878,45 @@ index 9ac8d15..a656a20 100644
      // macOS doesn't expose Linux-style pthread affinity masks; keep this a
      // no-op so higher layers can build and run.
      (void)mask;
-@@ -868,7 +985,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -833,6 +951,29 @@ class PosixCondition<Thread> : public PosixConditionBase {
+ 
+   void set_priority(int new_priority) {
+     WaitStarted();
++#if defined(__APPLE__)
++    // Darwin's SCHED_FIFO range does not contain the ThreadPriority values
++    // (EINVAL), so map them linearly onto the SCHED_OTHER range, keeping their
++    // order. Only ThreadPriority values are expected here.
++    static const int policy_min = sched_get_priority_min(SCHED_OTHER);
++    static const int policy_max = sched_get_priority_max(SCHED_OTHER);
++    const int rex_min = ThreadPriority::kLowest;
++    const int rex_max = ThreadPriority::kHighest;
++    const int clamped = std::clamp(new_priority, rex_min, rex_max);
++    sched_param param{};
++    param.sched_priority =
++        policy_min + (clamped - rex_min) * (policy_max - policy_min) / (rex_max - rex_min);
++    const int result = pthread_setschedparam(thread_, SCHED_OTHER, &param);
++    if (result != 0) {
++      // A lost priority is not worth an assert; report only the first failure.
++      static std::atomic<bool> warned{false};
++      if (!warned.exchange(true)) {
++        REXSYS_WARN("set_priority: pthread_setschedparam(SCHED_OTHER, {}) failed ({}); not "
++                    "reporting further failures",
++                    param.sched_priority, result);
++      }
++    }
++#else
+     sched_param param{};
+     param.sched_priority = new_priority;
+     int result = pthread_setschedparam(thread_, SCHED_FIFO, &param);
+@@ -849,6 +990,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+           break;
+       }
+     }
++#endif
+   }
+ 
+   void QueueUserCallback(std::function<void()> callback) {
+@@ -868,7 +1010,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
        return;
      }
  
@@ -1447,7 +1925,7 @@ index 9ac8d15..a656a20 100644
      // macOS has no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
      // without the sigval payload.
      int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
-@@ -1027,6 +1144,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -1027,6 +1169,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
  #endif
    }
    pthread_t thread_;
@@ -1457,7 +1935,7 @@ index 9ac8d15..a656a20 100644
    bool signaled_;
    int exit_code_;
    State state_;             // Protected by state_mutex_
-@@ -1511,6 +1631,8 @@ void Thread::Exit(int exit_code) {
+@@ -1511,6 +1656,8 @@ void Thread::Exit(int exit_code) {
  void set_current_thread_name(const std::string_view name) {
  #if defined(__APPLE__)
    pthread_setname_np(std::string(name).c_str());
@@ -1528,7 +2006,7 @@ index 8f2fcb0..a9ea8e2 100644
            rex::thread::Sleep(std::chrono::milliseconds(1));
          }
 diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
-index ec0df7c..47926fb 100644
+index ec0df7c..d403b82 100644
 --- a/src/graphics/shared_memory.cpp
 +++ b/src/graphics/shared_memory.cpp
 @@ -9,10 +9,13 @@
@@ -1681,7 +2159,7 @@ index ec0df7c..47926fb 100644
 +  uint64_t mask = 0;
 +  const uint32_t* until = &page_hot_until_ms_[size_t(block) * 64];
 +  for (uint32_t n = 0; n < 64; ++n) {
-+    if (int32_t(until[n] - now_ms) > 0) {
++    if (HotDeadlineActive(until[n], now_ms)) {
 +      mask |= uint64_t(1) << n;
 +    }
 +  }
@@ -1870,7 +2348,7 @@ index ec0df7c..47926fb 100644
  }
  
  bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
-@@ -494,6 +703,40 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+@@ -494,6 +703,54 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
  
    auto global_lock = global_critical_region_.Acquire();
  
@@ -1885,8 +2363,22 @@ index ec0df7c..47926fb 100644
 +      for (uint8_t& heat : page_heat_) {
 +        heat >>= 1;
 +      }
++      // Forget expired deadlines, so one cannot read as hot again when the
++      // wrapping comparison flips after 2^31 ms.
++      for (uint32_t& until : page_hot_until_ms_) {
++        if (until && !HotDeadlineActive(until, now_ms)) {
++          until = 0;
++        }
++      }
++      if (!HotDeadlineActive(page_hot_latest_until_ms_, now_ms)) {
++        page_hot_latest_until_ms_ = 0;
++      }
 +    }
-+    const uint32_t hot_until = now_ms + std::max(REXCVAR_GET(shared_memory_hot_page_ms), uint32_t(1));
++    uint32_t hot_until = now_ms + std::max(REXCVAR_GET(shared_memory_hot_page_ms), uint32_t(1));
++    if (!hot_until) {
++      // 0 is the not-hot marker.
++      hot_until = 1;
++    }
 +    for (uint32_t page = page_first; page <= page_last; ++page) {
 +      if (page_heat_[page] < 255) {
 +        ++page_heat_[page];
@@ -1911,7 +2403,7 @@ index ec0df7c..47926fb 100644
    if (!exact_range) {
      // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be
      // invalidated - if no GPU-written data nearby that was not intended to be
-@@ -514,6 +757,8 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+@@ -514,6 +771,8 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
        page_last =
            (page_last & ~uint32_t(63)) + (std::max(rex::tzcnt(gpu_written_end), uint8_t(1)) - 1);
      }
@@ -1920,7 +2412,7 @@ index ec0df7c..47926fb 100644
    }
  
    for (uint32_t i = block_first; i <= block_last; ++i) {
-@@ -528,6 +773,14 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+@@ -528,6 +787,14 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
      system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
    }
  
@@ -2358,6 +2850,26 @@ index 76cc877..0de733a 100644
  }
  
  uint32_t PhysicalHeap::GetPhysicalAddress(uint32_t address) const {
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 77bce25..49ca57c 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -471,7 +471,15 @@ X_STATUS XThread::Create() {
+   }
+ 
+   if (creation_params_.creation_flags & 0x60) {
++#if REX_PLATFORM_MAC
++    // The host only accepts ThreadPriority values (the raw 1/0 below is the
++    // Windows scale).
++    thread_->set_priority(creation_params_.creation_flags & 0x20
++                              ? rex::thread::ThreadPriority::kAboveNormal
++                              : rex::thread::ThreadPriority::kNormal);
++#else
+     thread_->set_priority(creation_params_.creation_flags & 0x20 ? 1 : 0);
++#endif
+   }
+ 
+   // Assign the newly created thread to the logical processor, and also set up
 diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
 index 5bd3dc5..5e450f4 100644
 --- a/src/ui/CMakeLists.txt
@@ -2673,6 +3185,260 @@ index 2251429..b883bf7 100644
  #else
    SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
    if (allowed_types & Surface::kTypeFlag_WaylandSurface) {
+diff --git a/tests/ppc/CMakeLists.txt b/tests/ppc/CMakeLists.txt
+index 9933e95..fd85b6c 100644
+--- a/tests/ppc/CMakeLists.txt
++++ b/tests/ppc/CMakeLists.txt
+@@ -8,6 +8,11 @@ set(PPC_OBJ_DIR ${CMAKE_BINARY_DIR}/tests/ppc/obj)
+ set(PPC_BIN_DIR ${CMAKE_BINARY_DIR}/tests/ppc/bin)
+ set(PPC_GEN_DIR ${CMAKE_BINARY_DIR}/tests/ppc/generated)
+ 
++# Prebuilt .bin/.map files replace the assemble/link steps (see ppc_test_pipeline.cmake)
++if(REXGLUE_PPC_PREBUILT_DIR)
++    set(PPC_BIN_DIR ${REXGLUE_PPC_PREBUILT_DIR})
++endif()
++
+ file(MAKE_DIRECTORY ${PPC_OBJ_DIR})
+ file(MAKE_DIRECTORY ${PPC_BIN_DIR})
+ file(MAKE_DIRECTORY ${PPC_GEN_DIR})
+@@ -96,8 +101,10 @@ endif()
+ target_compile_options(ppc_tests PRIVATE
+     -UTRACY_ENABLE -UREXGLUE_ENABLE_PROFILING
+     -UREXGLUE_ENABLE_PERF_COUNTERS -UREXGLUE_PROFILE_GUEST_FUNCTIONS
+-    -msse4.1 -mssse3
+ )
++if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
++    target_compile_options(ppc_tests PRIVATE -msse4.1 -mssse3)
++endif()
+ 
+ include(Catch)
+ catch_discover_tests(ppc_tests
+diff --git a/tests/ppc/asm/instr_fadd_rounding.s b/tests/ppc/asm/instr_fadd_rounding.s
+new file mode 100644
+index 0000000..378b455
+--- /dev/null
++++ b/tests/ppc/asm/instr_fadd_rounding.s
+@@ -0,0 +1,76 @@
++test_fadd_rounding_1:
++  #_ REGISTER_IN f1 0x1.0p+0
++  #_ REGISTER_IN f2 0x1.0p-60
++  #_ REGISTER_IN f4 0x2
++  #_ REGISTER_IN f31 0x0
++  mtfsf 0xFF, f4
++  fadd f3, f1, f2
++  mtfsf 0xFF, f31
++  blr
++  #_ REGISTER_OUT f3 0x1.0000000000001p+0
++
++test_fadd_rounding_2:
++  #_ REGISTER_IN f1 0x1.0p+0
++  #_ REGISTER_IN f2 0x1.0p-60
++  #_ REGISTER_IN f4 0x3
++  #_ REGISTER_IN f31 0x0
++  mtfsf 0xFF, f4
++  fadd f3, f1, f2
++  mtfsf 0xFF, f31
++  blr
++  #_ REGISTER_OUT f3 0x1.0p+0
++
++test_fadd_rounding_3:
++  #_ REGISTER_IN f1 -0x1.0p+0
++  #_ REGISTER_IN f2 0x1.0p-60
++  #_ REGISTER_IN f4 0x2
++  #_ REGISTER_IN f31 0x0
++  mtfsf 0xFF, f4
++  fadd f3, f1, f2
++  mtfsf 0xFF, f31
++  blr
++  #_ REGISTER_OUT f3 -0x1.0p+0
++
++test_fadd_rounding_4:
++  #_ REGISTER_IN f1 -0x1.0p+0
++  #_ REGISTER_IN f2 0x1.0p-60
++  #_ REGISTER_IN f4 0x3
++  #_ REGISTER_IN f31 0x0
++  mtfsf 0xFF, f4
++  fadd f3, f1, f2
++  mtfsf 0xFF, f31
++  blr
++  #_ REGISTER_OUT f3 -0x1.0000000000001p+0
++
++test_fadd_rounding_5:
++  #_ REGISTER_IN f1 0x1.0p+0
++  #_ REGISTER_IN f2 0x1.0p-60
++  #_ REGISTER_IN f4 0x1
++  #_ REGISTER_IN f31 0x0
++  mtfsf 0xFF, f4
++  fadd f3, f1, f2
++  mtfsf 0xFF, f31
++  blr
++  #_ REGISTER_OUT f3 0x1.0p+0
++
++test_fadd_rounding_6:
++  #_ REGISTER_IN f1 -0x1.0p+0
++  #_ REGISTER_IN f2 0x1.0p-60
++  #_ REGISTER_IN f4 0x1
++  #_ REGISTER_IN f31 0x0
++  mtfsf 0xFF, f4
++  fadd f3, f1, f2
++  mtfsf 0xFF, f31
++  blr
++  #_ REGISTER_OUT f3 -0x1.0p+0
++
++test_fadd_rounding_7:
++  #_ REGISTER_IN f1 0x1.0p+0
++  #_ REGISTER_IN f2 0x1.0p-60
++  #_ REGISTER_IN f4 0x0
++  #_ REGISTER_IN f31 0x0
++  mtfsf 0xFF, f4
++  fadd f3, f1, f2
++  mtfsf 0xFF, f31
++  blr
++  #_ REGISTER_OUT f3 0x1.0p+0
+diff --git a/tests/ppc/asm/instr_mtfsf.s b/tests/ppc/asm/instr_mtfsf.s
+new file mode 100644
+index 0000000..9751f57
+--- /dev/null
++++ b/tests/ppc/asm/instr_mtfsf.s
+@@ -0,0 +1,101 @@
++test_mtfsf_1:
++  #_ REGISTER_IN f2 0x0
++  #_ REGISTER_IN f31 0x0
++  mtfsf 0xFF, f2
++  mffs f3
++  mtfsf 0xFF, f31
++  blr
++  #_ REGISTER_OUT f2 0x0
++  #_ REGISTER_OUT f3 0x0
++  #_ REGISTER_OUT f31 0x0
++
++test_mtfsf_2:
++  #_ REGISTER_IN f2 0x1
++  #_ REGISTER_IN f31 0x0
++  mtfsf 0xFF, f2
++  mffs f3
++  mtfsf 0xFF, f31
++  blr
++  #_ REGISTER_OUT f2 0x1
++  #_ REGISTER_OUT f3 0x1
++  #_ REGISTER_OUT f31 0x0
++
++test_mtfsf_3:
++  #_ REGISTER_IN f2 0x2
++  #_ REGISTER_IN f31 0x0
++  mtfsf 0xFF, f2
++  mffs f3
++  mtfsf 0xFF, f31
++  blr
++  #_ REGISTER_OUT f2 0x2
++  #_ REGISTER_OUT f3 0x2
++  #_ REGISTER_OUT f31 0x0
++
++test_mtfsf_4:
++  #_ REGISTER_IN f2 0x3
++  #_ REGISTER_IN f31 0x0
++  mtfsf 0xFF, f2
++  mffs f3
++  mtfsf 0xFF, f31
++  blr
++  #_ REGISTER_OUT f2 0x3
++  #_ REGISTER_OUT f3 0x3
++  #_ REGISTER_OUT f31 0x0
++
++test_mtfsf_5:
++  #_ REGISTER_IN f2 0x3
++  #_ REGISTER_IN f31 0x0
++  mtfsf 0xFF, f31
++  mtfsf 0x01, f2
++  mffs f3
++  mtfsf 0xFF, f31
++  blr
++  #_ REGISTER_OUT f3 0x3
++  #_ REGISTER_OUT f31 0x0
++
++test_mtfsf_6:
++  #_ REGISTER_IN f2 0x2
++  #_ REGISTER_IN f31 0x0
++  mtfsf 0xFF, f31
++  mtfsf 0x0F, f2
++  mffs f3
++  mtfsf 0xFF, f31
++  blr
++  #_ REGISTER_OUT f3 0x2
++  #_ REGISTER_OUT f31 0x0
++
++test_mtfsf_7:
++  #_ REGISTER_IN f2 0xF0000001
++  #_ REGISTER_IN f4 0x2
++  #_ REGISTER_IN f31 0x0
++  mtfsf 0xFF, f4
++  mtfsf 0x80, f2
++  mffs f3
++  mtfsf 0xFF, f31
++  blr
++  #_ REGISTER_OUT f3 0x2
++  #_ REGISTER_OUT f31 0x0
++
++test_mtfsf_8:
++  #_ REGISTER_IN f2 0x3
++  #_ REGISTER_IN f4 0x2
++  #_ REGISTER_IN f31 0x0
++  mtfsf 0xFF, f4
++  mtfsf 0x7E, f2
++  mffs f3
++  mtfsf 0xFF, f31
++  blr
++  #_ REGISTER_OUT f3 0x2
++  #_ REGISTER_OUT f31 0x0
++
++test_mtfsf_9:
++  #_ REGISTER_IN f2 0x3
++  #_ REGISTER_IN f4 0x1
++  #_ REGISTER_IN f31 0x0
++  mtfsf 0xFF, f4
++  mtfsf 0x00, f2
++  mffs f3
++  mtfsf 0xFF, f31
++  blr
++  #_ REGISTER_OUT f3 0x1
++  #_ REGISTER_OUT f31 0x0
+diff --git a/tests/ppc/asm/instr_sync.s b/tests/ppc/asm/instr_sync.s
+new file mode 100644
+index 0000000..862e5c5
+--- /dev/null
++++ b/tests/ppc/asm/instr_sync.s
+@@ -0,0 +1,31 @@
++test_sync_1:
++  #_ MEMORY_IN 10001000 00 00 00 00
++  #_ REGISTER_IN r4 0x10001000
++  #_ REGISTER_IN r5 0x12345678
++  #_ REGISTER_IN r7 0x0BADF00D
++  stw r5, 0(r4)
++  sync
++  lwarx r6, 0, r4
++  lwsync
++  stwcx. r7, 0, r4
++  eieio
++  isync
++  ptesync
++  lwz r9, 0(r4)
++  blr
++  #_ REGISTER_OUT r4 0x10001000
++  #_ REGISTER_OUT r6 0x12345678
++  #_ REGISTER_OUT r7 0x0BADF00D
++  #_ REGISTER_OUT r9 0x0BADF00D
++  #_ REGISTER_OUT cr 0x20000000
++  #_ MEMORY_OUT 10001000 0b ad f0 0d
++
++test_sync_2:
++  #_ REGISTER_IN r3 0x12345678
++  sync
++  lwsync
++  eieio
++  isync
++  ptesync
++  blr
++  #_ REGISTER_OUT r3 0x12345678
 diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
 index 7bd264b..77c4f5c 100644
 --- a/tests/unit/CMakeLists.txt
