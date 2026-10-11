@@ -65,7 +65,7 @@ def symbolize(symbolizer, binary, offsets):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("profile")
-    ap.add_argument("--bin", default=None)
+    ap.add_argument("--bin", default=None, help="Build directory, .app bundle or Contents/MacOS directory")
     ap.add_argument("--symbolizer", default=None)
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--threads", type=int, default=3)
@@ -88,7 +88,13 @@ def main():
     resolved = {}
     for mod, offsets in by_module.items():
         if args.bin:
-            names = symbolize(args.symbolizer, os.path.join(args.bin, mod), sorted(offsets))
+            binary = os.path.join(args.bin, mod)
+            for folder in ("", "vulkan/lib", "Contents/MacOS", "Contents/MacOS/vulkan/lib"):
+                candidate = os.path.join(args.bin, folder, mod)
+                if os.path.isfile(candidate):
+                    binary = candidate
+                    break
+            names = symbolize(args.symbolizer, binary, sorted(offsets))
             for off, name in names.items():
                 if name and name != "??":
                     resolved[(mod, off)] = name

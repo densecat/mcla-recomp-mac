@@ -135,7 +135,9 @@ scripts/make_app_mac.sh
 open MCLA.app
 ```
 
-Use `scripts/make_app_mac.sh --preset mac-arm64-relwithdebinfo` to package that build instead. Packaging does not compile the game. It replaces the previous `MCLA.app` at the repository root with the executable, `librexruntime.dylib`, `librexgpu-xenos.dylib`, and the Vulkan loader, MoltenVK and ICD manifest under `Contents/MacOS/vulkan/`. No game data is copied into the bundle.
+Use `scripts/make_app_mac.sh --preset mac-arm64-relwithdebinfo` to package that build instead. Packaging does not compile the game. It replaces the previous `MCLA.app` at the repository root with the executable, `librexruntime.dylib` and `librexgpu-xenos.dylib` under `Contents/MacOS`, the Vulkan loader and MoltenVK under `Contents/MacOS/vulkan/lib`, and the ICD manifest at `Contents/Resources/MoltenVK_icd.json`. No game data is copied into the bundle.
+
+The manifest's library path is relative to Resources (`../MacOS/vulkan/lib/libMoltenVK.dylib`). Keeping the `icd.d` directory out of MacOS avoids codesign treating it as a nested bundle. Before Vulkan initializes, bundle launches set `VK_DRIVER_FILES` to this manifest if that variable is unset. An existing `VK_ICD_FILENAMES` override is copied into it instead, preserving the legacy override even when the SDK discovers another ICD. Bare binaries keep the SDK's original `vulkan/share/vulkan/icd.d` layout.
 
 The script signs each dylib, then the executable, then the bundle with an ad-hoc signature, verifies it strictly, and runs `check_arm64.sh` on the bundle. No Developer ID or notarization is needed for this local build. You can repeat the checks:
 
@@ -150,7 +152,11 @@ The executable's rpath is `@executable_path`; dependencies must resolve to the b
 
 Keep **MCLA.app at the repository root**. The existing game-data search reaches `<repo>/game/default.xex` three levels above `Contents/MacOS`; moving the bundle to Applications breaks that automatic lookup.
 
-Bundle launches load and save settings at `~/Library/Application Support/MCLA/mcla.toml`. The folder is created on startup, including when `--game_data_root` is supplied. Bare-binary launches keep their existing config beside the executable. These are separate settings files; packaging does not migrate them. Bundle launch and settings persistence still need a real Mac run.
+Bundle launches load and save settings at `~/Library/Application Support/MCLA/mcla.toml` and default to a rotating log at `~/Library/Logs/MCLA/mcla.log`. The folders are created on startup, including when `--game_data_root` is supplied; if `HOME` is absent, the account's home directory is used. Explicit `--log_file`, `REX_LOG_FILE` or TOML `log_file` values take precedence. Bare-binary launches keep their existing config and default logs beside the executable. These are separate settings files; packaging does not migrate them.
+
+Other default writes also stay outside the bundle: user data is under `~/.local/share/mcla` (or `$XDG_DATA_HOME/mcla`), with cache and shader cache beneath `cache/`. The crash tracer appends to the selected log and stderr; it creates no separate dump file. Performance CSVs, sampling profiles and shader dumps require explicit paths, and ImGui's automatic INI saving is disabled. Use paths outside the bundle for explicit output overrides. Bundle launch and signature persistence still need a real Mac run; repeat `codesign --verify --strict --verbose=2 MCLA.app` after quitting.
+
+Automatic recovery with `scripts/play_loop_mac.sh` preserves the build directory's `MCLA_STRICT_FP` setting when rebuilding. For sampling reports, `scripts/profile_report.py --bin` accepts the build directory, `MCLA.app`, or `MCLA.app/Contents/MacOS`; it also searches the corresponding `vulkan/lib` directory for loader and MoltenVK symbols.
 
 ## Updating
 
@@ -173,7 +179,7 @@ If you use the app, rerun `scripts/make_app_mac.sh` after building; an existing 
 | `build_mac.sh` says "Delete the folder ... and run this again" | Its cache check found a different compiler, architecture, deployment target, SDK prefix, old `REXSDK_DIR`, missing sysroot or translated CMake host. Delete only the build folder named in the message (normally `out/build/mac-arm64-release`), then rerun the build. The script deliberately does not reuse incompatible cached objects. |
 | SDK configure reports a non-arm64 host | Fix the shell and CMake architecture first, then delete the SDK build folder named in the message (`third_party/rexglue-sdk/out/build/mac-arm64`) and rerun `make_mac.sh`. |
 | `codegen failed` or `build failed` | Check `game/default.xex` and the supported release, then read `out/codegen.log` or `out/build.log`. Reduce `--jobs` if the compiler ran out of memory. |
-| Vulkan cannot find a driver, or loads an unexpected one | `VK_DRIVER_FILES` overrides the bundled ICD. Run `unset VK_DRIVER_FILES` in the launching shell and retry. Do not point it at a Homebrew driver. Confirm `vulkan/share/vulkan/icd.d/MoltenVK_icd.json` and both `vulkan/lib/` dylibs exist beside `mcla`. |
+| Vulkan cannot find a driver, or loads an unexpected one | `VK_DRIVER_FILES` (or legacy `VK_ICD_FILENAMES` for bundle launches) overrides the bundled ICD. Run `unset VK_DRIVER_FILES VK_ICD_FILENAMES` in the launching shell and retry. Do not point them at a Homebrew driver. For bare binaries, confirm `vulkan/share/vulkan/icd.d/MoltenVK_icd.json` and both `vulkan/lib/` dylibs exist beside `mcla`; in the app, the JSON is at `Contents/Resources/MoltenVK_icd.json` and the dylibs are under `Contents/MacOS/vulkan/lib`. |
 | Runtime library missing or packaging check fails | Rerun `scripts/build_mac.sh` with the matching `--preset` to stage the runtime files again, then package again. Read the unresolved dependency reported by `check_arm64.sh`; it must not depend on the SDK build tree or Homebrew. |
 | Smoke screenshots are blank or show no windows | Give Terminal (or the app hosting the shell) Screen Recording permission in System Settings > Privacy & Security. Restart that app if requested, and keep the game window in front. Screenshots capture the whole screen. |
 | App cannot find game data | Keep `MCLA.app` beside `game/` at the repository root. The bundle contains no game files. |

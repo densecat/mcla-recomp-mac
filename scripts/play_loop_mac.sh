@@ -72,7 +72,14 @@ while [ "$i" -le "$MAX_RESTARTS" ]; do
     fi
     [ "$i" -lt "$MAX_RESTARTS" ] || fail "restart limit reached at 0x$addr ($LOG)"
     echo "after ${elapsed}s: missing function 0x$addr, rebuilding and relaunching"
+    BUILD_ARGS=(--preset "$PRESET")
+    if [ -f "$BUILD/CMakeCache.txt" ]; then
+        strict_fp="$(cache_value "$BUILD/CMakeCache.txt" MCLA_STRICT_FP | tr '[:lower:]' '[:upper:]')"
+        case "$strict_fp" in
+            ON | YES | TRUE | Y | 1) BUILD_ARGS+=(--strict-fp) ;;
+        esac
+    fi
     printf '\n[functions."0x%s"]\nname = "sub_%s"\n' "$addr" "$addr" >> "$HINTS" || fail "cannot write $HINTS"
-    "$MAC_SCRIPTS/build_mac.sh" --preset "$PRESET" || fail "rebuild failed; see out/logs and out/build.log"
+    "$MAC_SCRIPTS/build_mac.sh" "${BUILD_ARGS[@]}" || fail "rebuild failed; see out/logs and out/build.log"
     i=$((i + 1))
 done

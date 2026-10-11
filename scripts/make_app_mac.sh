@@ -18,34 +18,49 @@ case "$PRESET" in *arm64*) ;; *) fail "preset '$PRESET' is not an arm64 preset" 
 [ "$(uname -m)" = "arm64" ] || fail "packaging needs a native Apple Silicon shell"
 translated="$(sysctl -n sysctl.proc_translated 2> /dev/null || echo 0)"
 [ "$translated" = "0" ] || fail "this shell runs under Rosetta; open a native Terminal and run this again"
-for tool in codesign otool lipo file; do
+for tool in codesign otool lipo file python3; do
     command -v "$tool" > /dev/null 2>&1 || fail "$tool is missing; install the Xcode command line tools"
 done
 
 BUILD="$ROOT/out/build/$PRESET"
 APP="$ROOT/MCLA.app"
 MACOS="$APP/Contents/MacOS"
+RESOURCES="$APP/Contents/Resources"
 [ -x "$BUILD/mcla" ] || fail "$BUILD/mcla is missing; run scripts/build_mac.sh --preset $PRESET first"
 RUNTIME_FILES=(
     vulkan/lib/libMoltenVK.dylib
     vulkan/lib/libvulkan.1.dylib
     librexruntime.dylib
     librexgpu-xenos.dylib
-    vulkan/share/vulkan/icd.d/MoltenVK_icd.json
 )
-for rel in "${RUNTIME_FILES[@]}"; do
+ICD="vulkan/share/vulkan/icd.d/MoltenVK_icd.json"
+for rel in "${RUNTIME_FILES[@]}" "$ICD"; do
     [ -f "$BUILD/$rel" ] || fail "$BUILD/$rel is missing; run scripts/build_mac.sh --preset $PRESET again"
 done
 
 step "assemble MCLA.app"
 [ ! -L "$APP" ] || fail "$APP is a symlink; move it aside before packaging"
 rm -rf "$APP" || fail "could not remove the previous $APP"
-mkdir -p "$MACOS" || fail "could not create $MACOS"
+mkdir -p "$MACOS" "$RESOURCES" || fail "could not create the bundle folders"
 cp -f "$BUILD/mcla" "$MACOS/mcla" || fail "could not copy mcla"
 for rel in "${RUNTIME_FILES[@]}"; do
     mkdir -p "$MACOS/$(dirname "$rel")" || fail "could not create the folder for $rel"
     cp -f "$BUILD/$rel" "$MACOS/$rel" || fail "could not copy $rel"
 done
+
+# Dotted directories under MacOS are treated as nested bundles by codesign.
+# The host selects this resource before Vulkan starts; dylib lookup is unchanged.
+python3 - "$BUILD/$ICD" "$RESOURCES/MoltenVK_icd.json" <<'PY' || fail "could not relocate the Vulkan ICD"
+import json
+import sys
+
+with open(sys.argv[1]) as source:
+    manifest = json.load(source)
+manifest["ICD"]["library_path"] = "../MacOS/vulkan/lib/libMoltenVK.dylib"
+with open(sys.argv[2], "w") as target:
+    json.dump(manifest, target, indent=4)
+    target.write("\n")
+PY
 
 cat > "$APP/Contents/Info.plist" <<'EOF' || fail "could not write Info.plist"
 <?xml version="1.0" encoding="UTF-8"?>
