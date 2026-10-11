@@ -5,8 +5,8 @@
 # Executables are checked first: their dependencies are followed through
 # @executable_path, @loader_path and the LC_RPATH entries each image brings
 # plus those it inherits from the images that loaded it. A file no executable
-# reaches (a dylib that is dlopened, or checked alone) is checked standalone
-# with its own folder and its own LC_RPATH entries. Prints a table and exits 1
+# reaches (a dylib that is dlopened, or checked alone) is checked standalone,
+# as if the first executable dlopened it. Prints a table and exits 1
 # on any failure.
 #   ./scripts/check_arm64.sh <dir|file>...
 set -u
@@ -56,12 +56,14 @@ EOF
 is_executable() { otool -hv "$1" 2> /dev/null | grep -q ' EXECUTE '; }
 
 # The LC_RPATH entries of $1, with @loader_path replaced by $2 and
-# @executable_path by $3, one per line.
+# @executable_path by $3, one per line. An absolute entry is marked with a
+# leading "!": it ties the app to one location, so a hit through it fails.
 image_rpaths() {
     local rp
     otool -l "$1" 2> /dev/null |
         awk '/^ *cmd LC_RPATH/ { r = 1; next } r && /^ *path / { sub(/^ *path /, ""); sub(/ \(offset [0-9]+\)$/, ""); print; r = 0 }' |
         while IFS= read -r rp; do
+            case "$rp" in @*) ;; *) rp="!$rp" ;; esac
             rp="${rp//@loader_path/$2}"
             rp="${rp//@executable_path/$3}"
             printf '%s\n' "$rp"
@@ -97,8 +99,9 @@ inside() {
 
 # Prints where the dependency $1 resolves to inside the checked roots, or fails.
 # $2 is the folder of the loading image, $3 the folder of the executable (empty
-# if unknown), $4 the rpath list (one per line, already substituted). A
-# candidate outside the roots does not count, whatever the rpath that found it.
+# if unknown), $4 the rpath list (one per line, already substituted). Like dyld,
+# the first rpath with an existing candidate decides: it must lie inside the
+# roots and come from a relative (@-prefixed) rpath.
 resolve_dep() {
     local rp res
     case "$1" in
@@ -107,10 +110,14 @@ resolve_dep() {
         @rpath/*)
             while IFS= read -r rp; do
                 [ -n "$rp" ] || continue
-                if res="$(inside "$rp/${1#@rpath/}")"; then
-                    printf '%s\n' "$res"
-                    return 0
-                fi
+                case "$rp" in
+                    !*) [ -e "${rp#!}/${1#@rpath/}" ] && return 1 ;;
+                    *)
+                        if [ -e "$rp/${1#@rpath/}" ]; then
+                            inside "$rp/${1#@rpath/}"
+                            return
+                        fi ;;
+                esac
             done <<EOF
 $4
 EOF
@@ -151,14 +158,20 @@ $(image_deps "$img")
 EOF
 }
 
-# A file no executable reaches: its own folder, its own rpaths, and its own
-# folder as the executable's only if the checked files hold no executable.
+# A file no executable links to. With an executable among the checked files it
+# is taken to be dlopened by the first one: @executable_path is that folder and
+# the executable's rpaths follow its own. Without one, its own folder stands in.
 check_standalone() {
     local img="$1" loader exe_dir stack dep
     loader="$(dirname "$img")"
-    exe_dir=""
-    [ "$have_exe" -eq 1 ] || exe_dir="$loader"
-    stack="$(image_rpaths "$img" "$loader" "$exe_dir")"
+    if [ -n "$first_exe" ]; then
+        exe_dir="$(dirname "$first_exe")"
+        stack="$(image_rpaths "$img" "$loader" "$exe_dir")
+$(image_rpaths "$first_exe" "$exe_dir" "$exe_dir")"
+    else
+        exe_dir="$loader"
+        stack="$(image_rpaths "$img" "$loader" "$exe_dir")"
+    fi
     while IFS= read -r dep; do
         [ -n "$dep" ] || continue
         case "$dep" in
@@ -208,9 +221,13 @@ done < <(list_files "$@")
 
 # Dependencies: from each executable, then the rest on their own.
 have_exe=0
+first_exe=""
 while IFS= read -r f; do
     [ -n "$f" ] || continue
-    if is_executable "$f"; then have_exe=1; fi
+    if is_executable "$f"; then
+        have_exe=1
+        [ -n "$first_exe" ] || first_exe="$(canon "$f")"
+    fi
 done <<EOF
 $files
 EOF
@@ -255,7 +272,7 @@ $info
 EOF
 echo "$count Mach-O file(s) checked"
 if [ "$standalone" -gt 0 ] && [ "$have_exe" -eq 1 ]; then
-    echo "$standalone file(s) no executable links to were checked standalone (own folder, own rpaths)"
+    echo "$standalone file(s) no executable links to were checked standalone (as if dlopened by $first_exe)"
 fi
 if [ "$count" -eq 0 ]; then
     echo "FAILED: no Mach-O files found" >&2

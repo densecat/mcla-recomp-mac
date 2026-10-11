@@ -156,7 +156,14 @@ check_build_cache() {
         "" | "$INSTALL"/*) ;;
         *) fail "$dir found the SDK at '$got', not in '$INSTALL'. Delete the folder (rm -rf '$dir') and run this again" ;;
     esac
+    got="$(cache_value "$cache" REXSDK_DIR)"
+    [ -z "$got" ] || fail "$dir builds the SDK from source at REXSDK_DIR='$got' instead of using '$INSTALL'. Delete the folder (rm -rf '$dir') and run this again"
     sysroot="$(cache_value "$cache" CMAKE_OSX_SYSROOT)"
+    # A name such as macosx is resolved by xcrun, as CMake does.
+    case "$sysroot" in
+        "" | /*) ;;
+        *) sysroot="$(xcrun --sdk "$sysroot" --show-sdk-path 2> /dev/null || echo "$sysroot (unknown SDK name)")" ;;
+    esac
     if [ -n "$sysroot" ] && [ ! -d "$sysroot" ]; then
         fail "$dir was configured with CMAKE_OSX_SYSROOT='$sysroot', which does not exist. Delete the folder (rm -rf '$dir') and run this again"
     fi
