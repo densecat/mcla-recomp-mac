@@ -1,5 +1,5 @@
 #!/bin/bash
-# Synthetic generated headers, no game data, CI only.
+# Synthetic generated sources, no game data, CI only.
 # Usage: ci_host_stub.sh OUT_DIR SDK_SRC
 set -euo pipefail
 
@@ -45,13 +45,20 @@ if matches.returncode not in (0, 1):
 # DECLARE_REX_FUNC declares both the hook and its __imp__ entry point.
 symbols = sorted({name.removeprefix("__imp__") for name in matches.stdout.split()})
 
-# Render only the header templates' empty-project branches. Keep their fixed
+# Render only the templates' empty-project branches. Keep their fixed
 # text verbatim, including the indirect-call include and platform macros.
 # Unknown template syntax must fail rather than silently weaken the canary.
 values = dict.fromkeys(
     ("image_base", "image_size", "code_base", "code_size", "thunk_reserve_size"), "0"
 )
 values["project"] = "mcla"
+flags = (
+    "skip_lr", "ctr_as_local", "xer_as_local", "reserved_as_local", "skip_msr",
+    "cr_as_local", "non_argument_as_local", "non_volatile_as_local",
+)
+for flag in flags:
+    values["config_flags." + flag] = "false"
+values['cmake_var("CMAKE_CURRENT_LIST_DIR")'] = "${CMAKE_CURRENT_LIST_DIR}"
 
 
 def render(name):
@@ -65,20 +72,55 @@ def render(name):
     )
     text = text.replace("{% if rexcrt_heap %}1{% else %}0{% endif %}", "0")
     text = re.sub(
+        r"{% if has_dll_modules and not is_dll %}.*?{% endif %}", "", text,
+        flags=re.DOTALL,
+    )
+    text = re.sub(
+        r"{% if is_dll %}.*?{% else %}(.*?){% endif %}", r"\1", text,
+        flags=re.DOTALL,
+    )
+    text = re.sub(r"{% if is_dll %}.*?{% endif %}", "", text, flags=re.DOTALL)
+    text = re.sub(
         r"{% for fn in functions %}(.*?){% endfor %}",
-        lambda m: "".join(m[1].replace("{{ fn.name }}", symbol) for symbol in symbols),
+        # Declarations for host references, but no guest address mappings.
+        lambda m: "".join(m[1].replace("{{ fn.name }}", symbol) for symbol in symbols)
+        if name == "funcs_h.inja" else "",
+        text, flags=re.DOTALL,
+    )
+    text = re.sub(
+        r"{% for file in recomp_files %}(.*?){% endfor %}",
+        lambda m: m[1].replace("{{ file }}", "mcla_ci_stubs.cpp"),
         text, flags=re.DOTALL,
     )
     for key, value in values.items():
         text = text.replace("{{ " + key + " }}", value)
     if any(token in text for token in ("{%", "{{", "{#")):
         sys.exit("ci_host_stub: unsupported template syntax in " + name)
-    return "// Synthetic, no game data, CI only.\n" + text
+    prefix = "#" if name == "sources_cmake.inja" else "//"
+    return prefix + " Synthetic, no game data, CI only.\n" + text
 
 
-headers = {"mcla_" + kind + ".h": render(kind + "_h.inja") for kind in ("init", "pch", "funcs")}
+outputs = {"mcla_" + kind + ".h": render(kind + "_h.inja") for kind in ("init", "pch", "funcs")}
+outputs.update({"mcla_" + kind + ".cpp": render(kind + "_cpp.inja")
+                for kind in ("init", "register")})
+outputs["sources.cmake"] = render("sources_cmake.inja")
+# The SDK macro supplies weak hooks and strong __imp__ entry points. Host hooks
+# can override the former; any call into a synthetic original must fail loudly.
+outputs["mcla_ci_stubs.cpp"] = (
+    '// Synthetic, no game data, CI only.\n#include "mcla_init.h"\n#include <cstdio>\n#include <cstdlib>\n'
+    + "".join(
+        f'DEFINE_REX_FUNC({symbol}) {{\n'
+        '  (void)ctx; (void)base;\n'
+        f'  std::fputs("CI guest stub called: {symbol}\\n", stderr);\n'
+        '  std::abort();\n}\n' for symbol in symbols
+    )
+)
 generated.mkdir(parents=True)
-for name, text in headers.items():
+for name, text in outputs.items():
     (generated / name).write_text(text)
-print(f"Synthetic headers: {generated} ({len(symbols)} host-referenced guest symbols)")
+stamp = str(generated / "codegen.build.stamp")
+stamp = stamp.replace("\\", "\\\\").replace("$", "$$").replace(" ", "\\ ").replace("#", "\\#")
+(generated / "codegen.d").write_text(stamp + ":\n")
+(generated / "codegen.build.stamp").touch()
+print(f"Synthetic sources: {generated} ({len(symbols)} host-referenced guest symbols)")
 PY
