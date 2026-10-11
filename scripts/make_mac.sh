@@ -18,6 +18,7 @@
 #   --play           start the game when the build is done
 #   --install-tools  install missing CMake and Ninja without asking first
 #   --preset NAME    CMake preset of the game build (default mac-arm64-release)
+#   --strict-fp      enable strict floating point for game code (default off)
 #   --sdk-only       stop after the SDK is built and installed (step 3)
 #   --with-tests     also build the SDK's tests; needs --ppc-bins. Reconfigures
 #                    and rebuilds the SDK even when it is already installed
@@ -33,6 +34,7 @@ set -u
 ISO=""
 PLAY=0
 PRESET="mac-arm64-release"
+STRICT_FP=OFF
 SDK_ONLY=0
 WITH_TESTS=0
 PPC_BINS=""
@@ -43,6 +45,7 @@ while [ "$#" -gt 0 ]; do
         --play) PLAY=1; shift ;;
         --install-tools) INSTALL_TOOLS=1; shift ;;
         --preset) [ "$#" -ge 2 ] || fail "--preset needs a name"; PRESET="$2"; shift 2 ;;
+        --strict-fp) STRICT_FP=ON; shift ;;
         --sdk-only) SDK_ONLY=1; shift ;;
         --with-tests) WITH_TESTS=1; shift ;;
         --ppc-bins) [ "$#" -ge 2 ] || fail "--ppc-bins needs a folder"; PPC_BINS="$2"; shift 2 ;;
@@ -146,6 +149,7 @@ fi
 # -----------------------------------------------------------------------
 step "5/6 recompile the game's code and build it (several minutes the first time)"
 build_args="--preset $PRESET"
+if [ "$STRICT_FP" = ON ]; then build_args="$build_args --strict-fp"; fi
 if [ -n "$JOBS" ]; then build_args="$build_args --jobs $JOBS"; fi
 # shellcheck disable=SC2086 # build_args is a list of options without spaces in values
 "$MAC_SCRIPTS/build_mac.sh" $build_args || fail "build_mac.sh failed"

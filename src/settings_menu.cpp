@@ -36,7 +36,7 @@ REXCVAR_DEFINE_BOOL(mcla_settings_menu, true, "MCLA",
                     "Add the settings submenus to the pause menu");
 
 // Set by a host that keeps the settings file somewhere other than next to
-// the executable (PS5).
+// the executable (PS5 or a macOS bundle).
 const char* g_mcla_settings_path = nullptr;
 
 namespace {
@@ -776,7 +776,7 @@ void SaveSettingsIfChanged() {
     return;
   }
   // The file the runtime loads at start: <executable folder>/mcla.toml, or
-  // the file a host without a writable executable folder names.
+  // the host's override (Application Support for a macOS bundle).
   const auto path = g_mcla_settings_path
                         ? std::filesystem::path(g_mcla_settings_path)
                         : rex::filesystem::GetExecutableFolder() / "mcla.toml";

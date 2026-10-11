@@ -1,6 +1,6 @@
 # Native Apple Silicon build of the ReXGlue SDK (patched) plus an x86-64 Linux
-# regression guard. CI builds ONLY the SDK and its tests. No game files, keys,
-# or generated/default/ output ever enter this workflow or its artifacts.
+# regression guard. Host compilation uses synthetic headers in a temporary
+# directory. No game files, keys, or game-derived output enter CI or artifacts.
 name: mac-arm64
 
 on:
@@ -9,6 +9,7 @@ on:
     paths:
       - "patches/**"
       - "scripts/**"
+      - "src/**"
       - "CMakeLists.txt"
       - "CMakePresets.json"
       - "generated/rexglue.cmake"
@@ -182,6 +183,44 @@ jobs:
           set -o pipefail
           mkdir -p out/logs
           scripts/check_arm64.sh third_party/rexglue-sdk/out/install/mac-arm64 2>&1 | tee out/logs/arch-report.txt
+
+      - name: Compile host sources (synthetic generated headers)
+        run: |
+          host_dir="$(mktemp -d "$RUNNER_TEMP/mcla-host.XXXXXX")"
+          trap 'rm -rf "$host_dir"' EXIT
+          scripts/ci_host_stub.sh "$host_dir" "$GITHUB_WORKSPACE/third_party/rexglue-sdk"
+          cat > "$host_dir/CMakeLists.txt" <<'CMAKE'
+          cmake_minimum_required(VERSION 3.25)
+          project(mcla_host_canary LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 23)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          find_package(rexglue 0.10.0 REQUIRED CONFIG)
+
+          file(GLOB host_sources CONFIGURE_DEPENDS "${MCLA_SOURCE_DIR}/src/*.cpp")
+          add_library(mcla_host OBJECT ${host_sources})
+          target_include_directories(mcla_host PRIVATE
+              "${CMAKE_CURRENT_SOURCE_DIR}"
+              "${MCLA_SOURCE_DIR}/src"
+              "${CMAKE_CURRENT_SOURCE_DIR}/generated/default")
+          target_link_libraries(mcla_host PRIVATE rex::runtime)
+          # rexglue_configure_target also stages runtime dylibs, which needs an
+          # executable. Reuse its compile settings and host support sources.
+          rexglue_apply_target_settings(mcla_host)
+          target_compile_definitions(mcla_host PRIVATE REXGLUE_BUILD_CONFIG="$<CONFIG>")
+          target_sources(mcla_host PRIVATE
+              "${REXGLUE_SHARE_DIR}/windowed_app_main_sdl.cpp"
+              "${REXGLUE_SHARE_DIR}/rex_app.cpp")
+          if(APPLE AND CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+              target_compile_options(mcla_host PRIVATE -ffp-contract=off)
+          endif()
+          CMAKE
+          cmake -S "$host_dir" -B "$host_dir/build" -G Ninja \
+            -DMCLA_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/third_party/rexglue-sdk/out/install/mac-arm64" \
+            -DCMAKE_CXX_COMPILER=/usr/bin/clang++ -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS=-march=armv8-a \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
+          cmake --build "$host_dir/build" --target mcla_host --parallel -- -k 0
 
       # Assembled from the SDK's own tests/ppc/asm sources; host-independent.
       - name: Download assembled PPC test binaries

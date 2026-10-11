@@ -3,6 +3,7 @@
 #include "mcla_app.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 
@@ -36,6 +37,24 @@ std::unique_ptr<rex::system::IAudioSystem> CreateMclaAudioSystem(
 // run: find the extracted game next to the executable or, as the build leaves
 // it, in the repository a few folders up, and load the Xenos GPU plugin.
 void MclaApp::OnConfigurePaths(rex::PathConfig& paths) {
+#ifdef __APPLE__
+  // Inside a .app bundle the executable folder is part of the signed bundle,
+  // so settings live in Application Support. Without HOME, keep the default.
+  const char* home = std::getenv("HOME");
+  if (home && *home &&
+      rex::filesystem::GetExecutablePath().string().find("/Contents/MacOS/") !=
+          std::string::npos) {
+    paths.config_path = std::filesystem::path(home) /
+                        "Library/Application Support/MCLA/mcla.toml";
+    std::error_code ec;
+    std::filesystem::create_directories(paths.config_path.parent_path(), ec);
+    // Keep the menu's save path alive for the lifetime of the application.
+    static std::string settings_path;
+    settings_path = paths.config_path.string();
+    extern const char* g_mcla_settings_path;
+    g_mcla_settings_path = settings_path.c_str();
+  }
+#endif
   if (!paths.game_data_root.empty()) {
     return;
   }

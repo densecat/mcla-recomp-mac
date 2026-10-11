@@ -14,6 +14,7 @@ Static recompilation of *Midnight Club: Los Angeles Complete Edition* (Xbox 360,
 |---|---|
 | Windows, D3D12 | Boots; menus, races, garage and upgrades work with audio and controller. 30 FPS with occasional texture-load hitches. |
 | Windows, Vulkan | Reaches the title screen. Not tested further. |
+| macOS, arm64 (Apple Silicon) | builds in CI; first game run pending |
 | Linux | Not built yet. |
 | PS5 (jailbroken) | Plays: career, races, garage, saves, audio and controller, at a steady 30 FPS on a PS5 Pro (firmware 13.42), where the zoomed-out map runs at 20 to 25. Also tested on a PS5 Slim (firmware 12.70), installed from scratch with the one-command build, where it runs well; frame rates were measured on the Pro only. Build and install with one command: `docs/ps5-build-guide.md`. |
 
@@ -35,6 +36,14 @@ The game's PowerPC code is translated to C++ ahead of time by the [ReXGlue SDK](
 
 It clones and patches the ReXGlue SDK, builds it, extracts your game, recompiles its code and builds `mcla.exe`. Then double-click the **Midnight Club Los Angeles** shortcut it leaves in the repository folder (or `mcla.exe` itself); no options are needed. Requirements (Git, CMake, Ninja, Clang 20, Visual Studio Build Tools, Python 3), every step by hand, options and troubleshooting are in [`docs/pc-build-guide.md`](docs/pc-build-guide.md).
 
+## Building and running (macOS)
+
+```bash
+scripts/make_mac.sh --iso /path/to/your.iso
+```
+
+Needs an Apple Silicon Mac, macOS 13.3 or newer, and Xcode 16 or its Command Line Tools. It builds the patched SDK and your game locally, then leaves a double-click launcher in the repository folder. Requirements, manual steps, `MCLA.app` packaging and troubleshooting are in [`docs/mac-build-guide.md`](docs/mac-build-guide.md). The SDK builds and passes its tests in CI; the first game run is pending.
+
 ## Building and installing (PS5)
 
 ```bash
@@ -52,7 +61,7 @@ on Arch Linux as root (a few commands to set up under WSL2 on Windows). It build
 | `patches/` | Changes to the ReXGlue SDK |
 | `scripts/` | Extraction, build, run and analysis scripts |
 | `ps5/` | The PS5 host, the one-command build (`make_ps5.sh`), title packaging and console probes |
-| `docs/` | Build guides for PC and PS5, recon report, architecture, function recovery, known issues, PS5 port notes |
+| `docs/` | Build guides for PC, macOS and PS5, recon report, architecture, function recovery, known issues, PS5 port notes |
 
 ## Credits
 
