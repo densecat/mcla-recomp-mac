@@ -1,8 +1,13 @@
 #!/bin/bash
 # Check that every Mach-O file under the given folders (or the given files) is
-# arm64 only, code-signed, and depends only on the system or on files that
-# really resolve through its own @loader_path, @executable_path or LC_RPATH
-# entries. Prints a table and exits 1 on any failure.
+# arm64 only, code-signed, and depends only on the system or on files inside
+# the checked folders, found the way the loader finds them.
+# Executables are checked first: their dependencies are followed through
+# @executable_path, @loader_path and the LC_RPATH entries each image brings
+# plus those it inherits from the images that loaded it. A file no executable
+# reaches (a dylib that is dlopened, or checked alone) is checked standalone
+# with its own folder and its own LC_RPATH entries. Prints a table and exits 1
+# on any failure.
 #   ./scripts/check_arm64.sh <dir|file>...
 set -u
 
@@ -11,65 +16,159 @@ if [ "$#" -eq 0 ]; then
     exit 2
 fi
 
+TAB="$(printf '\t')"
 bad=0
 count=0
-rows=""
+standalone=0
+roots=""     # canonical checked folders and files, one per line
+info=""      # per Mach-O file: path, archs, signed (tab separated)
+fails=""     # per canonical image: path, first dependency problem (tab separated)
+reached=""   # canonical images some executable reaches
+visited=""   # canonical images walked from the current executable
 
-# True when the @rpath/@loader_path/@executable_path dependency $1 names a file
-# that exists. $dir, $exe_dir and $rpaths are set by check_one. The executable
-# is not known for a dylib checked on its own, so its folder stands in.
-dep_resolves() {
-    local dep="$1" rp
-    case "$dep" in
-        @loader_path/*) [ -e "$dir/${dep#@loader_path/}" ] ;;
-        @executable_path/*) [ -e "$exe_dir/${dep#@executable_path/}" ] ;;
+# Absolute path with every symlink followed, for a file or a folder. Empty if
+# it does not exist. No readlink -f or realpath: macOS lacks them before 12.3.
+canon() {
+    local p="$1" t
+    while [ -L "$p" ]; do
+        t="$(readlink "$p")"
+        case "$t" in /*) p="$t" ;; *) p="$(dirname "$p")/$t" ;; esac
+    done
+    if [ -d "$p" ]; then
+        (cd "$p" 2> /dev/null && pwd -P)
+    else
+        (cd "$(dirname "$p")" 2> /dev/null && printf '%s/%s\n' "$(pwd -P)" "$(basename "$p")")
+    fi
+}
+
+# True when the canonical path $1 is a checked file or inside a checked folder.
+in_roots() {
+    local r
+    while IFS= read -r r; do
+        [ -n "$r" ] || continue
+        case "$1" in "$r" | "$r"/*) return 0 ;; esac
+    done <<EOF
+$roots
+EOF
+    return 1
+}
+
+is_executable() { otool -hv "$1" 2> /dev/null | grep -q ' EXECUTE '; }
+
+# The LC_RPATH entries of $1, with @loader_path replaced by $2 and
+# @executable_path by $3, one per line.
+image_rpaths() {
+    local rp
+    otool -l "$1" 2> /dev/null |
+        awk '/^ *cmd LC_RPATH/ { r = 1; next } r && /^ *path / { sub(/^ *path /, ""); sub(/ \(offset [0-9]+\)$/, ""); print; r = 0 }' |
+        while IFS= read -r rp; do
+            rp="${rp//@loader_path/$2}"
+            rp="${rp//@executable_path/$3}"
+            printf '%s\n' "$rp"
+        done
+}
+
+# The dependencies of $1 other than system libraries, one per line. Line 1 of
+# otool -L is the file name; a dylib's first dependency line is its own install
+# name.
+image_deps() {
+    local skip=1 n=0 dep
+    case "$(file -b "$1")" in *"dynamically linked shared library"*) skip=2 ;; esac
+    otool -L "$1" 2> /dev/null | while IFS= read -r dep; do
+        n=$((n + 1))
+        [ "$n" -gt "$skip" ] || continue
+        dep="${dep#"${dep%%[![:space:]]*}"}"
+        dep="${dep%% (*}"
+        case "$dep" in
+            /usr/lib/* | /System/*) ;;
+            *) printf '%s\n' "$dep" ;;
+        esac
+    done
+}
+
+# Prints the canonical path of the file $1 if it exists inside the checked roots.
+inside() {
+    local c
+    [ -e "$1" ] || return 1
+    c="$(canon "$1")"
+    [ -n "$c" ] && in_roots "$c" || return 1
+    printf '%s\n' "$c"
+}
+
+# Prints where the dependency $1 resolves to inside the checked roots, or fails.
+# $2 is the folder of the loading image, $3 the folder of the executable (empty
+# if unknown), $4 the rpath list (one per line, already substituted). A
+# candidate outside the roots does not count, whatever the rpath that found it.
+resolve_dep() {
+    local rp res
+    case "$1" in
+        @loader_path/*) inside "$2/${1#@loader_path/}" ;;
+        @executable_path/*) [ -n "$3" ] && inside "$3/${1#@executable_path/}" ;;
         @rpath/*)
             while IFS= read -r rp; do
                 [ -n "$rp" ] || continue
-                rp="${rp//@loader_path/$dir}"
-                rp="${rp//@executable_path/$exe_dir}"
-                [ -e "$rp/${dep#@rpath/}" ] && return 0
+                if res="$(inside "$rp/${1#@rpath/}")"; then
+                    printf '%s\n' "$res"
+                    return 0
+                fi
             done <<EOF
-$rpaths
+$4
 EOF
             return 1 ;;
         *) return 1 ;;
     esac
 }
 
-check_one() {
-    local f="$1" archs signed deps_ok kind skip dep first dir exe_dir rpaths
-    dir="$(dirname "$f")"
-    exe_dir="$dir"
-    rpaths="$(otool -l "$f" 2> /dev/null | awk '/^ *cmd LC_RPATH/ { r = 1; next } r && /^ *path / { sub(/^ *path /, ""); sub(/ \(offset [0-9]+\)$/, ""); print; r = 0 }')"
-    archs="$(lipo -archs "$f" 2> /dev/null)"
-    [ "$archs" = "arm64" ] || bad=1
-    if codesign -v "$f" > /dev/null 2>&1; then signed=yes; else signed=NO; bad=1; fi
-    deps_ok=yes
-    kind="$(file -b "$f")"
-    # Line 1 of otool -L is the file name; a dylib's first dependency line is
-    # its own install name.
-    skip=1
-    case "$kind" in *"dynamically linked shared library"*) skip=2 ;; esac
-    first=1
-    while IFS= read -r dep; do
-        if [ "$first" -le "$skip" ]; then
-            first=$((first + 1))
-            continue
-        fi
-        dep="${dep#"${dep%%[![:space:]]*}"}"
-        dep="${dep%% (*}"
-        case "$dep" in
-            /usr/lib/* | /System/*) ;;
-            @rpath/* | @loader_path/* | @executable_path/*)
-                # Has to ship with it: the file must exist where the loader looks.
-                dep_resolves "$dep" || { deps_ok="NO (unresolved $dep)"; bad=1; } ;;
-            *) deps_ok="NO ($dep)"; bad=1 ;;
-        esac
-    done < <(otool -L "$f" 2> /dev/null)
-    count=$((count + 1))
-    rows="$rows$f | ${archs:-?} | $signed | $deps_ok
+add_fail() { fails="$fails$1$TAB$2
+"; bad=1; }
+
+# Follow the dependencies of the canonical image $1 for the executable in folder
+# $2; $3 is the rpath list the images above it contribute.
+walk() {
+    local img="$1" exe_dir="$2" loader stack dep res
+    loader="$(dirname "$img")"
+    stack="$(image_rpaths "$img" "$loader" "$exe_dir")
+$3"
+    visited="$visited$img
 "
+    reached="$reached$img
+"
+    while IFS= read -r dep; do
+        [ -n "$dep" ] || continue
+        case "$dep" in
+            @rpath/* | @loader_path/* | @executable_path/*)
+                if res="$(resolve_dep "$dep" "$loader" "$exe_dir" "$stack")"; then
+                    if ! printf '%s' "$visited" | grep -qxF -- "$res" && file -b "$res" | grep -q '^Mach-O'; then
+                        walk "$res" "$exe_dir" "$stack"
+                    fi
+                else
+                    add_fail "$img" "unresolved $dep"
+                fi ;;
+            *) add_fail "$img" "$dep" ;;
+        esac
+    done <<EOF
+$(image_deps "$img")
+EOF
+}
+
+# A file no executable reaches: its own folder, its own rpaths, and its own
+# folder as the executable's only if the checked files hold no executable.
+check_standalone() {
+    local img="$1" loader exe_dir stack dep
+    loader="$(dirname "$img")"
+    exe_dir=""
+    [ "$have_exe" -eq 1 ] || exe_dir="$loader"
+    stack="$(image_rpaths "$img" "$loader" "$exe_dir")"
+    while IFS= read -r dep; do
+        [ -n "$dep" ] || continue
+        case "$dep" in
+            @rpath/* | @loader_path/* | @executable_path/*)
+                resolve_dep "$dep" "$loader" "$exe_dir" "$stack" > /dev/null || add_fail "$img" "unresolved $dep" ;;
+            *) add_fail "$img" "$dep" ;;
+        esac
+    done <<EOF
+$(image_deps "$img")
+EOF
 }
 
 list_files() {
@@ -86,17 +185,78 @@ list_files() {
 # list_files runs in a subshell, so unknown arguments are rejected here.
 for arg in "$@"; do
     [ -e "$arg" ] || { echo "no such file or folder: $arg" >&2; exit 1; }
+    roots="$roots$(canon "$arg")
+"
 done
 
+# Architecture and signature of every Mach-O file.
+files=""
 while IFS= read -r f; do
     case "$(file -b "$f")" in
-        Mach-O*) check_one "$f" ;;
+        Mach-O*) ;;
+        *) continue ;;
     esac
+    archs="$(lipo -archs "$f" 2> /dev/null)"
+    [ "$archs" = "arm64" ] || bad=1
+    if codesign -v "$f" > /dev/null 2>&1; then signed=yes; else signed=NO; bad=1; fi
+    count=$((count + 1))
+    files="$files$f
+"
+    info="$info$f$TAB${archs:-?}$TAB$signed
+"
 done < <(list_files "$@")
 
+# Dependencies: from each executable, then the rest on their own.
+have_exe=0
+while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if is_executable "$f"; then have_exe=1; fi
+done <<EOF
+$files
+EOF
+if [ "$have_exe" -eq 1 ]; then
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        if is_executable "$f"; then
+            c="$(canon "$f")"
+            visited=""
+            walk "$c" "$(dirname "$c")" ""
+        fi
+    done <<EOF
+$files
+EOF
+fi
+alone=""
+while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    c="$(canon "$f")"
+    if ! printf '%s' "$reached" | grep -qxF -- "$c"; then
+        standalone=$((standalone + 1))
+        alone="$alone$c
+"
+        check_standalone "$c"
+    fi
+done <<EOF
+$files
+EOF
+
 echo "file | archs | signed | deps ok"
-printf '%s' "$rows"
+while IFS="$TAB" read -r f archs signed; do
+    [ -n "$f" ] || continue
+    c="$(canon "$f")"
+    deps_ok="$(printf '%s' "$fails" | awk -F"$TAB" -v p="$c" '$1 == p { print "NO (" $2 ")"; exit }')"
+    if [ -z "$deps_ok" ]; then
+        deps_ok=yes
+        if printf '%s' "$alone" | grep -qxF -- "$c"; then deps_ok="yes (standalone)"; fi
+    fi
+    echo "$f | $archs | $signed | $deps_ok"
+done <<EOF
+$info
+EOF
 echo "$count Mach-O file(s) checked"
+if [ "$standalone" -gt 0 ] && [ "$have_exe" -eq 1 ]; then
+    echo "$standalone file(s) no executable links to were checked standalone (own folder, own rpaths)"
+fi
 if [ "$count" -eq 0 ]; then
     echo "FAILED: no Mach-O files found" >&2
     exit 1

@@ -139,7 +139,7 @@ cache_value() { sed -n "s/^$2:[A-Z]*=//p" "$1" | head -n 1; }
 # wrong and leaves stale objects of another architecture, so deleting the
 # folder is left to the user.
 check_build_cache() {
-    local dir="$1" cache="$1/CMakeCache.txt" pin key want got
+    local dir="$1" cache="$1/CMakeCache.txt" pin key want got sysroot system_file cpu f
     [ -f "$cache" ] || return 0
     for pin in CMAKE_C_COMPILER=$CC_BIN CMAKE_CXX_COMPILER=$CXX_BIN CMAKE_OSX_ARCHITECTURES=arm64 CMAKE_OSX_DEPLOYMENT_TARGET=13.3; do
         key="${pin%%=*}"
@@ -147,4 +147,26 @@ check_build_cache() {
         got="$(cache_value "$cache" "$key")"
         [ "$got" = "$want" ] || fail "$dir was configured with $key='$got', not '$want'. Delete the folder (rm -rf '$dir') and run this again"
     done
+    # The project finds the SDK with find_package(rexglue CONFIG), which
+    # build_mac.sh points at the install through CMAKE_PREFIX_PATH.
+    got="$(cache_value "$cache" CMAKE_PREFIX_PATH)"
+    [ "$got" = "$INSTALL" ] || fail "$dir was configured with CMAKE_PREFIX_PATH='$got', not '$INSTALL'. Delete the folder (rm -rf '$dir') and run this again"
+    got="$(cache_value "$cache" rexglue_DIR)"
+    case "$got" in
+        "" | "$INSTALL"/*) ;;
+        *) fail "$dir found the SDK at '$got', not in '$INSTALL'. Delete the folder (rm -rf '$dir') and run this again" ;;
+    esac
+    sysroot="$(cache_value "$cache" CMAKE_OSX_SYSROOT)"
+    if [ -n "$sysroot" ] && [ ! -d "$sysroot" ]; then
+        fail "$dir was configured with CMAKE_OSX_SYSROOT='$sysroot', which does not exist. Delete the folder (rm -rf '$dir') and run this again"
+    fi
+    # CMake does not cache the host processor; it writes it to CMakeSystem.cmake.
+    system_file=""
+    for f in "$dir"/CMakeFiles/*/CMakeSystem.cmake; do
+        if [ -f "$f" ]; then system_file="$f"; break; fi
+    done
+    if [ -n "$system_file" ]; then
+        cpu="$(sed -n 's/^set(CMAKE_HOST_SYSTEM_PROCESSOR "\(.*\)")$/\1/p' "$system_file" | head -n 1)"
+        [ "$cpu" = "arm64" ] || fail "$dir saw the host as '$cpu', not arm64 (CMake ran under Rosetta). Delete the folder (rm -rf '$dir') and run this again"
+    fi
 }
