@@ -2700,3 +2700,16 @@ index 9b4b90c..78efda1 100644
  }
  
  TEST_CASE("Stale generated files are swept after the write", "[codegen_writer]") {
+diff --git a/tests/unit/codegen/output_stamp_test.cpp b/tests/unit/codegen/output_stamp_test.cpp
+index d97edb5..f030f58 100644
+--- a/tests/unit/codegen/output_stamp_test.cpp
++++ b/tests/unit/codegen/output_stamp_test.cpp
+@@ -224,6 +224,6 @@ TEST_CASE("Depfile escapes characters make treats as syntax", "[output_stamp]")
+   std::ifstream in(depfile, std::ios::binary);
+   std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+ 
+-  CHECK(content.find("has\ space.toml") != std::string::npos);
+-  CHECK(content.find("hash\#.toml") != std::string::npos);
++  CHECK(content.find("has\\ space.toml") != std::string::npos);
++  CHECK(content.find("hash\\#.toml") != std::string::npos);
+ }
