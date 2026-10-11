@@ -109,6 +109,8 @@ void WaitForFrameDeadline() {
     while (NowMicros() < next_us) {
 #if defined(_WIN32)
       _mm_pause();
+#elif defined(__aarch64__)
+      __asm__ __volatile__("isb" ::: "memory");
 #else
       std::this_thread::yield();
 #endif

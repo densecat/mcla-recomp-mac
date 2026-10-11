@@ -2,7 +2,21 @@
 
 #include "mcla_app.h"
 
+#include <cstdint>
 #include <filesystem>
+#include <string>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
@@ -59,6 +73,32 @@ void MclaApp::OnPreSetup(rex::RuntimeConfig& config) {
 void MclaApp::OnPostSetup() {
   ConfigureFrameTiming();
 
+  // Host facts for bug reports. proc_translated 1 means running under Rosetta.
+#if defined(__aarch64__) || defined(_M_ARM64)
+  const char* host_arch = "arm64";
+#else
+  const char* host_arch = "x86_64";
+#endif
+#ifdef __APPLE__
+  int translated = -1;
+  size_t translated_size = sizeof(translated);
+  if (sysctlbyname("sysctl.proc_translated", &translated, &translated_size, nullptr, 0) != 0) {
+    translated = -1;
+  }
+  std::string translated_text = std::to_string(translated);
+#else
+  std::string translated_text = "n/a";
+#endif
+#ifdef _WIN32
+  SYSTEM_INFO system_info;
+  GetSystemInfo(&system_info);
+  long page_size = static_cast<long>(system_info.dwPageSize);
+#else
+  long page_size = sysconf(_SC_PAGESIZE);
+#endif
+  REXLOG_INFO("host: arch={} proc_translated={} page_size={} guest_membase=0x{:X}", host_arch,
+              translated_text, page_size,
+              static_cast<uint64_t>(reinterpret_cast<uintptr_t>(runtime()->virtual_membase())));
 
   // The game probes for loose city data on a "t:" drive that retail consoles
   // do not have. Give it a device so the probes fail with "not found" rather
