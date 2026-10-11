@@ -386,7 +386,7 @@ index 85994c7..eec442c 100644
  #else
        auto result = std::from_chars(p, end, v.f32[i], std::chars_format::general);
 diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
-index 0c39a42..261e9e0 100644
+index 0c39a42..6a617d4 100644
 --- a/include/rex/system/xmemory.h
 +++ b/include/rex/system/xmemory.h
 @@ -36,10 +36,11 @@ namespace rex::memory::detail {
@@ -402,7 +402,25 @@ index 0c39a42..261e9e0 100644
    return (guest_addr >= 0xE0000000u) ? 0x1000u : 0u;
  #else
    return 0u;
-@@ -558,7 +559,7 @@ class Memory {
+@@ -325,6 +326,17 @@ class PhysicalHeap : public BaseHeap {
+  protected:
+   bool IsHostPageWriteWatched(uint32_t host_page_number) const override;
+ 
++  // Union of the guest access of every guest page that overlaps both a
++  // write-watch unit (system_page, counted from membase_ + heap_base_ like
++  // system_page_flags_) and the heap-relative byte range
++  // [range_first, range_last]. A watch unit can be several guest pages when
++  // guest pages are smaller than the host page (or the watch granularity), so
++  // looking at only its first guest page misjudges the others. Matches
++  // SyncHostPageAccess: kReadWrite if any page is writable, otherwise
++  // kReadOnly if any is readable, otherwise kNoAccess.
++  rex::memory::PageAccess GetWatchUnitGuestAccess(uint32_t system_page, uint32_t range_first,
++                                                  uint32_t range_last) const;
++
+   // Allocation on these heaps delegates to parent_heap_, whose own reconcile
+   // pass takes the global critical region. Acquire whenever this heap or its
+   // parent will need it, so the ordering holds even for a heap whose own guest
+@@ -558,7 +570,7 @@ class Memory {
    bool HasAnyFunctionTable() const;
  
   private:
@@ -2734,7 +2752,7 @@ index fc46d86..5f57565 100644
  
  if(WIN32)
 diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
-index 76cc877..0de733a 100644
+index 76cc877..850e3be 100644
 --- a/src/system/xmemory.cpp
 +++ b/src/system/xmemory.cpp
 @@ -20,6 +20,11 @@
@@ -2885,7 +2903,19 @@ index 76cc877..0de733a 100644
    // TODO(Triang3l): Implement data providers.
    assert_false(enable_data_providers);
    if (!enable_invalidation_notifications && !enable_data_providers) {
-@@ -2175,6 +2228,9 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
+@@ -2133,8 +2186,10 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
+       assert_always();
+       continue;
+     }
++    // A system page can cover several guest pages, so judge it by every guest
++    // page in the requested range that overlaps it, not just the first.
+     rex::memory::PageAccess current_page_access =
+-        ToPageAccess(page_table_[guest_page_number].current_protect);
++        GetWatchUnitGuestAccess(i, heap_relative_address, heap_relative_address + (length - 1));
+     bool protect_system_page = false;
+     // Don't do anything with inaccessible pages - don't protect, don't enable
+     // callbacks - because real access violations are needed there. And don't
+@@ -2175,6 +2230,9 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
  bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                                      uint32_t virtual_address, uint32_t length, bool is_write,
                                      bool unwatch_exact_range, bool unprotect) {
@@ -2895,9 +2925,56 @@ index 76cc877..0de733a 100644
    // TODO(Triang3l): Support read watches.
    assert_true(is_write);
    if (!is_write) {
-@@ -2338,13 +2394,16 @@ std::unique_lock<std::recursive_mutex> PhysicalHeap::AcquireHostPageReconcileLoc
+@@ -2287,10 +2345,9 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
+       bool unprotect_page =
+           (system_page_flags_[i >> 6].notify_on_invalidation & (uint64_t(1) << (i & 63))) != 0;
+       if (unprotect_page) {
+-        uint32_t guest_page_number =
+-            rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
+-        if (ToPageAccess(page_table_[guest_page_number].current_protect) !=
+-            rex::memory::PageAccess::kReadWrite) {
++        // Restore the union of all the guest pages sharing the system page, as
++        // SyncHostPageAccess grants it, not the access of only the first one.
++        if (GetWatchUnitGuestAccess(i, 0, heap_size_ - 1) != rex::memory::PageAccess::kReadWrite) {
+           unprotect_page = false;
+         }
+       }
+@@ -2337,14 +2394,49 @@ std::unique_lock<std::recursive_mutex> PhysicalHeap::AcquireHostPageReconcileLoc
+   return lock;
  }
  
++rex::memory::PageAccess PhysicalHeap::GetWatchUnitGuestAccess(uint32_t system_page,
++                                                              uint32_t range_first,
++                                                              uint32_t range_last) const {
++  // Heap-relative extent of the system page, which starts host_address_offset()
++  // bytes before the heap-relative address of its first byte, clipped to the
++  // heap and to the requested range.
++  const uint64_t unit_start_host = uint64_t(system_page) * system_page_size_;
++  const uint64_t unit_end_host = unit_start_host + system_page_size_;
++  const uint64_t unit_start = std::max(
++      unit_start_host > host_address_offset() ? unit_start_host - host_address_offset() : 0,
++      uint64_t(range_first));
++  const uint64_t unit_end = std::min(
++      {unit_end_host - host_address_offset(), uint64_t(range_last) + 1, uint64_t(heap_size_)});
++  if (unit_start >= unit_end) {
++    return rex::memory::PageAccess::kNoAccess;
++  }
++  const uint32_t guest_page_first = uint32_t(unit_start >> page_size_shift_);
++  const uint32_t guest_page_last = uint32_t((unit_end - 1) >> page_size_shift_);
++  bool has_read = false;
++  for (uint32_t page_number = guest_page_first; page_number <= guest_page_last; ++page_number) {
++    const rex::memory::PageAccess page_access =
++        ToPageAccess(page_table_[page_number].current_protect);
++    if (page_access == rex::memory::PageAccess::kReadWrite) {
++      return rex::memory::PageAccess::kReadWrite;
++    }
++    if (page_access == rex::memory::PageAccess::kReadOnly) {
++      has_read = true;
++    }
++  }
++  return has_read ? rex::memory::PageAccess::kReadOnly : rex::memory::PageAccess::kNoAccess;
++}
++
  bool PhysicalHeap::IsHostPageWriteWatched(uint32_t host_page_number) const {
 -  // Indices match EnableAccessCallbacks: both count host pages from
 -  // membase_ + heap_base_, including host_address_offset().
