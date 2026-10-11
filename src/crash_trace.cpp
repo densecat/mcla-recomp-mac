@@ -123,7 +123,13 @@ class LineBuffer {
       data_[length_++] = *text++;
     }
   }
-  void Hex(uint64_t value, int digits) {
+  // At least min_digits digits, more if the value needs them.
+  void Hex(uint64_t value, int min_digits) {
+    int digits = 1;
+    while (digits < 16 && (value >> (digits * 4)) != 0) {
+      ++digits;
+    }
+    digits = std::max(digits, min_digits);
     for (int shift = (digits - 1) * 4; shift >= 0 && length_ < sizeof(data_) - 1; shift -= 4) {
       data_[length_++] = "0123456789ABCDEF"[(value >> shift) & 0xF];
     }
