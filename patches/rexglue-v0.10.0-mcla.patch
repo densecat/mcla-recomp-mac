@@ -429,6 +429,20 @@ index 0c39a42..6a617d4 100644
    int MapViewsMac();
  #endif
    int MapViews(uint8_t* mapping_base);
+diff --git a/include/rex/system/xthread.h b/include/rex/system/xthread.h
+index a72911e..0fc3dcf 100644
+--- a/include/rex/system/xthread.h
++++ b/include/rex/system/xthread.h
+@@ -425,7 +425,8 @@ class XThread : public XObject {
+   std::string thread_name_;
+   std::unique_ptr<runtime::ThreadState> thread_state_;
+ 
+-  int32_t priority_ = 0;
++  // The guest-scale priority last set; read by other threads through QueryPriority.
++  std::atomic<int32_t> priority_{0};
+ 
+ #if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+   std::mutex suspend_mutex_;
 diff --git a/include/rex/thread/fiber.h b/include/rex/thread/fiber.h
 index 352af67..2395dc9 100644
 --- a/include/rex/thread/fiber.h
@@ -2995,10 +3009,10 @@ index 76cc877..850e3be 100644
  
  uint32_t PhysicalHeap::GetPhysicalAddress(uint32_t address) const {
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
-index 77bce25..49ca57c 100644
+index 77bce25..3aef2f0 100644
 --- a/src/system/xthread.cpp
 +++ b/src/system/xthread.cpp
-@@ -471,7 +471,15 @@ X_STATUS XThread::Create() {
+@@ -471,7 +471,17 @@ X_STATUS XThread::Create() {
    }
  
    if (creation_params_.creation_flags & 0x60) {
@@ -3008,12 +3022,30 @@ index 77bce25..49ca57c 100644
 +    thread_->set_priority(creation_params_.creation_flags & 0x20
 +                              ? rex::thread::ThreadPriority::kAboveNormal
 +                              : rex::thread::ThreadPriority::kNormal);
++    // What QueryPriority reports is the guest's own scale.
++    priority_ = creation_params_.creation_flags & 0x20 ? 1 : 0;
 +#else
      thread_->set_priority(creation_params_.creation_flags & 0x20 ? 1 : 0);
 +#endif
    }
  
    // Assign the newly created thread to the logical processor, and also set up
+@@ -831,7 +841,15 @@ void XThread::RundownAPCs() {
+ }
+ 
+ int32_t XThread::QueryPriority() {
++#if REX_PLATFORM_MAC
++  // The guest gets back what it set (or the creation flags implied), in the
++  // scale SetPriority takes, so a saved priority restores exactly. The host
++  // value is in the ThreadPriority scale, which SetPriority would read as
++  // something else.
++  return priority_;
++#else
+   return thread_->priority();
++#endif
+ }
+ 
+ void XThread::SetPriority(int32_t increment) {
 diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
 index 5bd3dc5..5e450f4 100644
 --- a/src/ui/CMakeLists.txt
