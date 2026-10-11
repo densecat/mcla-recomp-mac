@@ -592,7 +592,7 @@ index 4edde2b..81f8d34 100644
      bool ext_KHR_xcb_surface = false;  // #6
  #endif
 diff --git a/resources/templates/codegen/pch_h.inja b/resources/templates/codegen/pch_h.inja
-index 68274d2..025f1b0 100644
+index 68274d2..ecb4497 100644
 --- a/resources/templates/codegen/pch_h.inja
 +++ b/resources/templates/codegen/pch_h.inja
 @@ -124,7 +124,7 @@ extern PPCFuncMapping PPCFuncMappings[];
@@ -604,7 +604,7 @@ index 68274d2..025f1b0 100644
  #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
  #else
  #define REX_PHYS_HOST_OFFSET(addr) 0u
-@@ -146,6 +146,32 @@ extern PPCFuncMapping PPCFuncMappings[];
+@@ -146,6 +146,34 @@ extern PPCFuncMapping PPCFuncMappings[];
  
  #define REX_MEMORY_SIZE 0x100000000ull
  
@@ -626,7 +626,9 @@ index 68274d2..025f1b0 100644
 +#define REX_SYNC() __asm__ __volatile__("dmb ish" ::: "memory")
 +#define REX_LWSYNC() __asm__ __volatile__("dmb ish" ::: "memory")
 +#define REX_EIEIO() __asm__ __volatile__("dmb ish" ::: "memory")
-+#define REX_ISYNC() __asm__ __volatile__("isb" ::: "memory")
++// isync: the guest acquire idiom (load; cmp; branch; isync) relies on the branch, which C++
++// may fold away, so a full barrier comes first.
++#define REX_ISYNC() __asm__ __volatile__("dmb ish\n\tisb" ::: "memory")
 +#else
 +#define REX_SYNC() ((void)0)
 +#define REX_LWSYNC() ((void)0)
@@ -638,7 +640,7 @@ index 68274d2..025f1b0 100644
  // MMIO
  //=============================================================================
 diff --git a/resources/templates/test/ppc_config_h.inja b/resources/templates/test/ppc_config_h.inja
-index 0c334f8..3b04430 100644
+index 0c334f8..d59ee84 100644
 --- a/resources/templates/test/ppc_config_h.inja
 +++ b/resources/templates/test/ppc_config_h.inja
 @@ -73,7 +73,7 @@
@@ -650,7 +652,7 @@ index 0c334f8..3b04430 100644
  #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
  #else
  #define REX_PHYS_HOST_OFFSET(addr) 0u
-@@ -95,6 +95,32 @@
+@@ -95,6 +95,34 @@
  
  #define REX_MEMORY_SIZE 0x100000000ull
  
@@ -672,7 +674,9 @@ index 0c334f8..3b04430 100644
 +#define REX_SYNC() __asm__ __volatile__("dmb ish" ::: "memory")
 +#define REX_LWSYNC() __asm__ __volatile__("dmb ish" ::: "memory")
 +#define REX_EIEIO() __asm__ __volatile__("dmb ish" ::: "memory")
-+#define REX_ISYNC() __asm__ __volatile__("isb" ::: "memory")
++// isync: the guest acquire idiom (load; cmp; branch; isync) relies on the branch, which C++
++// may fold away, so a full barrier comes first.
++#define REX_ISYNC() __asm__ __volatile__("dmb ish\n\tisb" ::: "memory")
 +#else
 +#define REX_SYNC() ((void)0)
 +#define REX_LWSYNC() ((void)0)
@@ -888,7 +892,7 @@ index fcfd6c9..7ac7790 100644
  #include <dlfcn.h>
  
 diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
-index 8b1c76a..efabf67 100644
+index 8b1c76a..a144699 100644
 --- a/src/core/exception_handler_posix.cpp
 +++ b/src/core/exception_handler_posix.cpp
 @@ -23,6 +23,12 @@
@@ -904,7 +908,7 @@ index 8b1c76a..efabf67 100644
  
  #include <rex/assert.h>
  #include <rex/logging.h>
-@@ -49,6 +55,98 @@ constexpr size_t kMaxHandlerCount = 8;
+@@ -49,6 +55,109 @@ constexpr size_t kMaxHandlerCount = 8;
  // Executed in order.
  std::pair<ExceptionHandler::Handler, void*> handlers_[kMaxHandlerCount];
  
@@ -969,11 +973,10 @@ index 8b1c76a..efabf67 100644
 +                                     : signal_number == SIGBUS ? &original_sigbus_handler_
 +                                                               : &original_sigsegv_handler_;
 +  const bool has_siginfo_handler = (original->sa_flags & SA_SIGINFO) != 0;
-+  const bool original_usable = has_siginfo_handler
-+                                   ? original->sa_sigaction != nullptr
-+                                   : (original->sa_handler != SIG_DFL &&
-+                                      original->sa_handler != SIG_IGN &&
-+                                      original->sa_handler != nullptr);
++  // sa_handler and sa_sigaction share storage, so SIG_DFL and SIG_IGN look the
++  // same in both forms.
++  const bool original_usable = original->sa_sigaction != nullptr &&
++                               original->sa_handler != SIG_DFL && original->sa_handler != SIG_IGN;
 +  if (original_usable) {
 +    // This handler runs with its signal blocked (no SA_NODEFER). The SEH
 +    // handler throws out of it for a guest SEH_TRY, which skips the sigreturn
@@ -988,22 +991,34 @@ index 8b1c76a..efabf67 100644
 +    } else {
 +      original->sa_handler(signal_number);
 +    }
++    // The original handler returned, which is its way of saying the fault is
++    // dealt with (it may have fixed the protection or the context), so just
++    // return and let the instruction retry. Ours stays installed: resetting it
++    // to SIG_DFL here would make the next legitimate write-watch or MMIO fault,
++    // on any thread, kill the process. If nothing was actually fixed the fault
++    // recurs and comes back through here, which is that handler's own choice.
++    return;
 +  }
-+  // Still here: the original handler returned, or there was none to call. The
-+  // faulting instruction would run into the same fault again, so make that
-+  // take the default action instead.
++  // There is no handler to call (SIG_DFL, or SIG_IGN, which would only make a
++  // synchronous fault recur forever). Take the default action explicitly
++  // rather than relying on the instruction to fault again after returning.
 +  struct sigaction default_action;
 +  std::memset(&default_action, 0, sizeof(default_action));
 +  default_action.sa_handler = SIG_DFL;
 +  sigemptyset(&default_action.sa_mask);
 +  sigaction(signal_number, &default_action, nullptr);
++  sigset_t unblock_set;
++  sigemptyset(&unblock_set);
++  sigaddset(&unblock_set, signal_number);
++  pthread_sigmask(SIG_UNBLOCK, &unblock_set, nullptr);
++  raise(signal_number);
 +}
 +#endif  // REX_PLATFORM_MAC
 +
  static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
                                       void* signal_context) {
  #if REX_PLATFORM_MAC
-@@ -417,6 +515,15 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+@@ -417,6 +526,15 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
        return;
      }
    }
@@ -1654,7 +1669,7 @@ index b4b885a..19ace70 100644
  #include <sys/ioctl.h>
  #include <unistd.h>
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15..c294801 100644
+index 9ac8d15..beb7add 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
 @@ -9,10 +9,11 @@
@@ -1878,7 +1893,44 @@ index 9ac8d15..c294801 100644
      // macOS doesn't expose Linux-style pthread affinity masks; keep this a
      // no-op so higher layers can build and run.
      (void)mask;
-@@ -833,6 +951,29 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -821,6 +939,31 @@ class PosixCondition<Thread> : public PosixConditionBase {
+ 
+   int priority() {
+     WaitStarted();
++#if defined(__APPLE__)
++    // Report in the ThreadPriority domain, the one set_priority() takes, as the
++    // value reaches the guest (KeQueryBasePriorityThread) and is handed back to
++    // set_priority(); the raw Darwin value would not round-trip.
++    const int requested = requested_priority_.load(std::memory_order_relaxed);
++    if (requested != kPriorityNotSet) {
++      return requested;
++    }
++    // Never set: translate the host's current value back, as the other
++    // targets report the host's value in this case.
++    int policy;
++    sched_param param{};
++    if (pthread_getschedparam(thread_, &policy, &param) != 0) {
++      return -1;
++    }
++    const int policy_min = sched_get_priority_min(policy);
++    const int policy_max = sched_get_priority_max(policy);
++    if (policy_max <= policy_min) {
++      return ThreadPriority::kNormal;
++    }
++    const int span = ThreadPriority::kHighest - ThreadPriority::kLowest;
++    const int host = std::clamp(param.sched_priority, policy_min, policy_max);
++    return ThreadPriority::kLowest +
++           ((host - policy_min) * span + (policy_max - policy_min) / 2) / (policy_max - policy_min);
++#else
+     int policy;
+     sched_param param{};
+     int ret = pthread_getschedparam(thread_, &policy, &param);
+@@ -829,10 +972,36 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     }
+ 
+     return param.sched_priority;
++#endif
+   }
  
    void set_priority(int new_priority) {
      WaitStarted();
@@ -1891,6 +1943,8 @@ index 9ac8d15..c294801 100644
 +    const int rex_min = ThreadPriority::kLowest;
 +    const int rex_max = ThreadPriority::kHighest;
 +    const int clamped = std::clamp(new_priority, rex_min, rex_max);
++    // Remembered even if the host refuses it: the guest reads this back.
++    requested_priority_.store(clamped, std::memory_order_relaxed);
 +    sched_param param{};
 +    param.sched_priority =
 +        policy_min + (clamped - rex_min) * (policy_max - policy_min) / (rex_max - rex_min);
@@ -1908,7 +1962,7 @@ index 9ac8d15..c294801 100644
      sched_param param{};
      param.sched_priority = new_priority;
      int result = pthread_setschedparam(thread_, SCHED_FIFO, &param);
-@@ -849,6 +990,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -849,6 +1018,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
            break;
        }
      }
@@ -1916,7 +1970,7 @@ index 9ac8d15..c294801 100644
    }
  
    void QueueUserCallback(std::function<void()> callback) {
-@@ -868,7 +1010,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -868,7 +1038,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
        return;
      }
  
@@ -1925,7 +1979,7 @@ index 9ac8d15..c294801 100644
      // macOS has no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
      // without the sigval payload.
      int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
-@@ -1027,6 +1169,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -1027,6 +1197,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
  #endif
    }
    pthread_t thread_;
@@ -1935,7 +1989,20 @@ index 9ac8d15..c294801 100644
    bool signaled_;
    int exit_code_;
    State state_;             // Protected by state_mutex_
-@@ -1511,6 +1656,8 @@ void Thread::Exit(int exit_code) {
+@@ -1043,6 +1216,12 @@ class PosixCondition<Thread> : public PosixConditionBase {
+   mutable std::condition_variable state_signal_;
+   std::deque<std::function<void()>> user_callbacks_;
+   std::atomic<bool> has_pending_user_callbacks_{false};
++#if defined(__APPLE__)
++  // The last ThreadPriority passed to set_priority(); the host value it was
++  // mapped to cannot be read back exactly.
++  static constexpr int kPriorityNotSet = std::numeric_limits<int>::min();
++  std::atomic<int> requested_priority_{kPriorityNotSet};
++#endif
+ #if REX_PLATFORM_ANDROID
+   // Name accessible via name() on Android before API 26 which added
+   // pthread_getname_np.
+@@ -1511,6 +1690,8 @@ void Thread::Exit(int exit_code) {
  void set_current_thread_name(const std::string_view name) {
  #if defined(__APPLE__)
    pthread_setname_np(std::string(name).c_str());

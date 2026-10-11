@@ -10,7 +10,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -25,6 +27,8 @@
 #endif
 #include <windows.h>
 #else
+#include <fcntl.h>
+#include <unistd.h>
 #include <rex/exception_handler.h>
 #ifdef __APPLE__
 #include <pthread.h>
@@ -104,11 +108,69 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info) {
   return EXCEPTION_CONTINUE_SEARCH;
 }
 #else
+// The fault handler runs on the faulting thread, which may hold a logging lock
+// or the heap lock, so it must not log, allocate or format with the C library.
+// It formats into stack buffers and write(2)s them to stderr and, when the log
+// file is known at install time, to a descriptor opened then.
+std::atomic<bool> g_reported{false};
+static_assert(std::atomic<bool>::is_always_lock_free, "needed in a signal handler");
+int g_log_fd = -1;
+
+class LineBuffer {
+ public:
+  void Str(const char* text) {
+    while (*text && length_ < sizeof(data_) - 1) {
+      data_[length_++] = *text++;
+    }
+  }
+  void Hex(uint64_t value, int digits) {
+    for (int shift = (digits - 1) * 4; shift >= 0 && length_ < sizeof(data_) - 1; shift -= 4) {
+      data_[length_++] = "0123456789ABCDEF"[(value >> shift) & 0xF];
+    }
+  }
+  void Dec(uint64_t value) {
+    char digits[20];
+    int count = 0;
+    do {
+      digits[count++] = static_cast<char>('0' + value % 10);
+      value /= 10;
+    } while (value);
+    while (count && length_ < sizeof(data_) - 1) {
+      data_[length_++] = digits[--count];
+    }
+  }
+  void Write() {
+    data_[length_++] = '\n';
+    WriteAll(STDERR_FILENO);
+    if (g_log_fd >= 0) {
+      WriteAll(g_log_fd);
+    }
+    length_ = 0;
+  }
+
+ private:
+  void WriteAll(int fd) const {
+    size_t done = 0;
+    while (done < length_) {
+      ssize_t n = write(fd, data_ + done, length_ - done);
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      if (n <= 0) {
+        break;
+      }
+      done += static_cast<size_t>(n);
+    }
+  }
+  // One spare byte for the newline.
+  char data_[192];
+  size_t length_ = 0;
+};
+
 // Note: on Apple each guest function is a weak musttail thunk plus an __imp__
 // body (pch_h.inja) and the dispatch table points at the thunk, so a pc is
 // attributed to the nearest thunk below it. Hooked functions may be misattributed.
 bool OnPosixFault(rex::arch::Exception* ex, void*) {
-  static std::atomic<bool> reported{false};
   if (ex->code() != rex::arch::Exception::Code::kAccessViolation) {
     return false;
   }
@@ -116,12 +178,16 @@ bool OnPosixFault(rex::arch::Exception* ex, void*) {
   if (fault < g_guest_base || fault >= g_guest_base + kNullPageSize) {
     return false;
   }
-  if (reported.exchange(true)) {
+  if (g_reported.exchange(true)) {
     return false;
   }
   uint64_t pc = ex->pc();
-  REXLOG_ERROR("guest null-page access at guest 0x{:08X}, host pc 0x{:016X}",
-               static_cast<uint32_t>(fault - g_guest_base), pc);
+  LineBuffer line;
+  line.Str("guest null-page access at guest 0x");
+  line.Hex(static_cast<uint32_t>(fault - g_guest_base), 8);
+  line.Str(", host pc 0x");
+  line.Hex(pc, 16);
+  line.Write();
 #if defined(__aarch64__)
   auto* context = ex->thread_context();
   uintptr_t stack_low = 0;
@@ -133,14 +199,24 @@ bool OnPosixFault(rex::arch::Exception* ex, void*) {
   stack_high = reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(self));
   stack_low = stack_high - pthread_get_stacksize_np(self);
 #endif
-  REXLOG_ERROR("host stack (innermost first):");
-  auto log_frame = [](int frame, uint64_t address) {
+  line.Str("host stack (innermost first):");
+  line.Write();
+  auto log_frame = [&line](int frame, uint64_t address) {
     uintptr_t offset = 0;
+    line.Str("  #");
+    line.Dec(static_cast<uint64_t>(frame));
+    line.Str(frame < 10 ? "  " : " ");
     if (uint32_t guest = GuestFunctionFor(static_cast<uintptr_t>(address), &offset)) {
-      REXLOG_ERROR("  #{:<2} sub_{:08X} +0x{:X} (host)", frame, guest, offset);
+      line.Str("sub_");
+      line.Hex(guest, 8);
+      line.Str(" +0x");
+      line.Hex(offset, 1);
+      line.Str(" (host)");
     } else {
-      REXLOG_ERROR("  #{:<2} host 0x{:016X}", frame, address);
+      line.Str("host 0x");
+      line.Hex(address, 16);
     }
+    line.Write();
   };
   log_frame(0, pc);
   // Frame records: [fp] is the previous fp, [fp + 8] the return address.
@@ -148,7 +224,9 @@ bool OnPosixFault(rex::arch::Exception* ex, void*) {
   uintptr_t last_fp = 0;
   int frame = 1;
   for (; frame < 32; ++frame) {
-    if ((fp & 0xF) != 0 || fp <= last_fp || fp < stack_low || fp + 16 > stack_high) {
+    // fp > stack_high - 16 instead of fp + 16 > stack_high: no wrap near UINTPTR_MAX.
+    if (stack_high < stack_low + 16 || (fp & 0xF) != 0 || fp <= last_fp || fp < stack_low ||
+        fp > stack_high - 16) {
       break;
     }
     const uintptr_t* record = reinterpret_cast<const uintptr_t*>(fp);
@@ -188,6 +266,12 @@ void MclaApp::InstallCrashTrace() {
 #ifdef _WIN32
   AddVectoredExceptionHandler(1, OnException);
 #else
+  // Opened here because open(2) is not worth risking inside the handler. Only
+  // an explicit log_file is known; otherwise the trace goes to stderr alone.
+  std::string log_path = REXCVAR_GET(log_file);
+  if (g_log_fd < 0 && !log_path.empty()) {
+    g_log_fd = open(log_path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+  }
   rex::arch::ExceptionHandler::Install(OnPosixFault, nullptr);
 #endif
   if (REXCVAR_GET(mcla_test_null_write)) {

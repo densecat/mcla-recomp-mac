@@ -18,6 +18,7 @@ case "$PRESET" in *arm64*) ;; *) fail "preset '$PRESET' is not an arm64 preset" 
 
 cd "$ROOT" || fail "cannot enter $ROOT"
 mkdir -p "$ROOT/out"
+preflight_tools
 [ -x "$INSTALL/bin/rexglue" ] || fail "the SDK is not installed ($INSTALL/bin/rexglue); run scripts/make_mac.sh --sdk-only"
 
 # The codegen stamp does not cover the rexglue binary, so a rebuilt or
@@ -42,9 +43,12 @@ for f in "$ROOT"/generated/default/*.cpp; do
 done
 echo "UNIMPLEMENTED in generated code: $unimpl"
 
+# An existing build folder is reused as it is, so it has to carry the pins.
+check_build_cache "$ROOT/out/build/$PRESET"
 if [ ! -f "$ROOT/out/build/$PRESET/build.ninja" ]; then
     if ! cmake --preset "$PRESET" "-DCMAKE_PREFIX_PATH=$INSTALL" \
-        "-DCMAKE_C_COMPILER=$CC_BIN" "-DCMAKE_CXX_COMPILER=$CXX_BIN" > "$ROOT/out/configure.log" 2>&1; then
+        "-DCMAKE_C_COMPILER=$CC_BIN" "-DCMAKE_CXX_COMPILER=$CXX_BIN" \
+        -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 > "$ROOT/out/configure.log" 2>&1; then
         tail -n 20 "$ROOT/out/configure.log"
         fail "configure failed (log: $ROOT/out/configure.log)"
     fi
@@ -66,9 +70,20 @@ PLUGIN="$(find "$INSTALL/lib" -name 'librexgpu-xenos.dylib' 2> /dev/null | head 
 [ -n "$PLUGIN" ] || fail "librexgpu-xenos.dylib not found under $INSTALL/lib"
 cp -f "$PLUGIN" "$BUILD/" || fail "could not copy $PLUGIN"
 
-# The SDK stages these next to the executable after the link.
-for rel in librexruntime.dylib vulkan/lib/libMoltenVK.dylib vulkan/share/vulkan/icd.d/MoltenVK_icd.json; do
-    [ -e "$BUILD/$rel" ] || echo "WARNING: $rel is missing next to mcla; the game will not start without it"
+# The SDK stages these next to the executable after the link. That step does
+# not rerun without a relink, so a file that went missing is copied again from
+# the SDK install, where the same files are installed (lib/ and share/).
+for rel in librexruntime.dylib vulkan/lib/libvulkan.1.dylib vulkan/lib/libMoltenVK.dylib vulkan/share/vulkan/icd.d/MoltenVK_icd.json; do
+    [ -e "$BUILD/$rel" ] && continue
+    case "$rel" in
+        librexruntime.dylib) src="$INSTALL/lib/librexruntime.dylib" ;;
+        vulkan/lib/*) src="$INSTALL/lib/${rel##*/}" ;;
+        *) src="$INSTALL/share/vulkan/icd.d/${rel##*/}" ;;
+    esac
+    [ -e "$src" ] || fail "$rel is missing next to mcla and $src is not there either: run scripts/make_mac.sh --sdk-only again, or delete $BUILD and run this again"
+    mkdir -p "$BUILD/$(dirname "$rel")"
+    cp -f "$src" "$BUILD/$rel" || fail "could not copy $src to $BUILD/$rel"
+    echo "staged again from the SDK install: $rel"
 done
 
 "$MAC_SCRIPTS/check_arm64.sh" "$BUILD" || fail "the build folder failed the arm64 check"

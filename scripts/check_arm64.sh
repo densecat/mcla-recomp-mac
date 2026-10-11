@@ -1,7 +1,8 @@
 #!/bin/bash
 # Check that every Mach-O file under the given folders (or the given files) is
-# arm64 only, code-signed, and depends only on the system or on files that ship
-# next to it. Prints a table and exits 1 on any failure.
+# arm64 only, code-signed, and depends only on the system or on files that
+# really resolve through its own @loader_path, @executable_path or LC_RPATH
+# entries. Prints a table and exits 1 on any failure.
 #   ./scripts/check_arm64.sh <dir|file>...
 set -u
 
@@ -14,8 +15,33 @@ bad=0
 count=0
 rows=""
 
+# True when the @rpath/@loader_path/@executable_path dependency $1 names a file
+# that exists. $dir, $exe_dir and $rpaths are set by check_one. The executable
+# is not known for a dylib checked on its own, so its folder stands in.
+dep_resolves() {
+    local dep="$1" rp
+    case "$dep" in
+        @loader_path/*) [ -e "$dir/${dep#@loader_path/}" ] ;;
+        @executable_path/*) [ -e "$exe_dir/${dep#@executable_path/}" ] ;;
+        @rpath/*)
+            while IFS= read -r rp; do
+                [ -n "$rp" ] || continue
+                rp="${rp//@loader_path/$dir}"
+                rp="${rp//@executable_path/$exe_dir}"
+                [ -e "$rp/${dep#@rpath/}" ] && return 0
+            done <<EOF
+$rpaths
+EOF
+            return 1 ;;
+        *) return 1 ;;
+    esac
+}
+
 check_one() {
-    local f="$1" archs signed deps_ok kind skip dep first
+    local f="$1" archs signed deps_ok kind skip dep first dir exe_dir rpaths
+    dir="$(dirname "$f")"
+    exe_dir="$dir"
+    rpaths="$(otool -l "$f" 2> /dev/null | awk '/^ *cmd LC_RPATH/ { r = 1; next } r && /^ *path / { sub(/^ *path /, ""); sub(/ \(offset [0-9]+\)$/, ""); print; r = 0 }')"
     archs="$(lipo -archs "$f" 2> /dev/null)"
     [ "$archs" = "arm64" ] || bad=1
     if codesign -v "$f" > /dev/null 2>&1; then signed=yes; else signed=NO; bad=1; fi
@@ -36,8 +62,8 @@ check_one() {
         case "$dep" in
             /usr/lib/* | /System/*) ;;
             @rpath/* | @loader_path/* | @executable_path/*)
-                # Has to ship with it: some file of that name in the checked tree.
-                grep -qxF "${dep##*/}" "$names" || { deps_ok="NO (missing ${dep##*/})"; bad=1; } ;;
+                # Has to ship with it: the file must exist where the loader looks.
+                dep_resolves "$dep" || { deps_ok="NO (unresolved $dep)"; bad=1; } ;;
             *) deps_ok="NO ($dep)"; bad=1 ;;
         esac
     done < <(otool -L "$f" 2> /dev/null)
@@ -61,10 +87,6 @@ list_files() {
 for arg in "$@"; do
     [ -e "$arg" ] || { echo "no such file or folder: $arg" >&2; exit 1; }
 done
-
-names="$(mktemp)"
-trap 'rm -f "$names"' EXIT
-list_files "$@" | sed 's|.*/||' | sort -u > "$names"
 
 while IFS= read -r f; do
     case "$(file -b "$f")" in

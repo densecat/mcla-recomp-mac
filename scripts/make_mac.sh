@@ -19,7 +19,12 @@
 #   --install-tools  install missing CMake and Ninja without asking first
 #   --preset NAME    CMake preset of the game build (default mac-arm64-release)
 #   --sdk-only       stop after the SDK is built and installed (step 3)
-#   --with-tests     also build the SDK's tests
+#   --with-tests     also build the SDK's tests; needs --ppc-bins. Reconfigures
+#                    and rebuilds the SDK even when it is already installed
+#   --ppc-bins DIR   folder with the assembled PowerPC test binaries (*.bin and
+#                    *.map, such as the ppc-test-bins artifact of the CI
+#                    workflow). The SDK's own assembler only runs on Linux and
+#                    Windows, so the tests cannot assemble them here
 #   --jobs N         number of parallel build jobs
 set -u
 # shellcheck source=mac_common.sh
@@ -27,10 +32,10 @@ set -u
 
 ISO=""
 PLAY=0
-INSTALL_TOOLS=0
 PRESET="mac-arm64-release"
 SDK_ONLY=0
 WITH_TESTS=0
+PPC_BINS=""
 JOBS=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -40,30 +45,23 @@ while [ "$#" -gt 0 ]; do
         --preset) [ "$#" -ge 2 ] || fail "--preset needs a name"; PRESET="$2"; shift 2 ;;
         --sdk-only) SDK_ONLY=1; shift ;;
         --with-tests) WITH_TESTS=1; shift ;;
+        --ppc-bins) [ "$#" -ge 2 ] || fail "--ppc-bins needs a folder"; PPC_BINS="$2"; shift 2 ;;
         --jobs) [ "$#" -ge 2 ] || fail "--jobs needs a number"; JOBS="$2"; shift 2 ;;
         *) fail "unknown option: $1 (see the top of scripts/make_mac.sh)" ;;
     esac
 done
 
-cd "$ROOT" || fail "cannot enter $ROOT"
+if [ "$WITH_TESTS" -eq 1 ]; then
+    [ -n "$PPC_BINS" ] || fail "--with-tests needs --ppc-bins DIR: the SDK's PowerPC assembler does not run on macOS (see the top of scripts/make_mac.sh)"
+    [ -d "$PPC_BINS" ] || fail "no such folder: $PPC_BINS"
+    PPC_BINS="$(cd "$PPC_BINS" && pwd)"
+    ls "$PPC_BINS"/*.bin > /dev/null 2>&1 || fail "no *.bin files in $PPC_BINS"
+    ls "$PPC_BINS"/*.map > /dev/null 2>&1 || fail "no *.map files in $PPC_BINS"
+elif [ -n "$PPC_BINS" ]; then
+    fail "--ppc-bins is only used together with --with-tests"
+fi
 
-# Major version of "x.y.z" style text.
-major_of() { echo "${1%%.*}"; }
-# True when $1 >= $2, both dotted versions.
-version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -t. -k1,1n -k2,2n -k3,3n | head -n 1)" = "$2" ]; }
-# The file a command name really is, following symlinks (macOS has no readlink -f
-# before 12.3 and none in some setups, so walk the links).
-resolve() {
-    local p
-    p="$(command -v "$1")" || return 1
-    while [ -L "$p" ]; do
-        local t
-        t="$(readlink "$p")"
-        case "$t" in /*) p="$t" ;; *) p="$(dirname "$p")/$t" ;; esac
-    done
-    echo "$p"
-}
-has_arm64() { lipo -archs "$(resolve "$1")" 2> /dev/null | tr ' ' '\n' | grep -qx arm64; }
+cd "$ROOT" || fail "cannot enter $ROOT"
 
 # -----------------------------------------------------------------------
 step "1/6 tools"
@@ -71,67 +69,8 @@ case "$PRESET" in
     *arm64*) ;;
     *) fail "preset '$PRESET' is not an arm64 preset (the mac-base preset defaults to x86_64); use mac-arm64-release" ;;
 esac
-[ "$(uname -m)" = "arm64" ] || fail "this needs an Apple Silicon Mac, or a Terminal that runs natively; uname -m says '$(uname -m)'. A Terminal or shell started under Rosetta makes every tool build x86_64"
-translated="$(sysctl -n sysctl.proc_translated 2> /dev/null || echo 0)"
-[ "$translated" = "0" ] || fail "this shell runs under Rosetta (sysctl.proc_translated=$translated). Open a Terminal that is not set to 'Open using Rosetta' (Get Info on the app) and run this again"
-
-[ -x "$CXX_BIN" ] || fail "$CXX_BIN is missing: install Xcode 16 or newer, or run 'xcode-select --install'"
-cxx_version="$("$CXX_BIN" --version 2> /dev/null | head -n 1)"
-case "$cxx_version" in
-    *"Apple clang"*) ;;
-    *) fail "$CXX_BIN is not Apple clang ($cxx_version): install Xcode 16 or newer, or run 'xcode-select --install'" ;;
-esac
-apple_major="$(echo "$cxx_version" | sed -n 's/.*version \([0-9][0-9]*\).*/\1/p')"
-if [ -z "$apple_major" ] || [ "$apple_major" -lt 16 ]; then
-    fail "Apple clang 16 or newer is needed ($cxx_version): install Xcode 16 or newer, or run 'xcode-select --install'"
-fi
-
-missing=""
-command -v git > /dev/null 2>&1 || missing="$missing git"
-command -v cmake > /dev/null 2>&1 || missing="$missing cmake"
-command -v ninja > /dev/null 2>&1 || missing="$missing ninja"
-command -v python3 > /dev/null 2>&1 || missing="$missing python3"
-if [ -n "$missing" ]; then
-    echo "missing:$missing"
-    for tool in $missing; do
-        case "$tool" in
-            git | python3) fail "$tool is missing: run 'xcode-select --install' (it provides Git and Python 3) and run this again" ;;
-        esac
-    done
-    # Only cmake and/or ninja are missing: Homebrew can provide them.
-    if [ "$INSTALL_TOOLS" -ne 1 ]; then
-        printf 'Install them now with Homebrew (brew install cmake ninja)? [y/N] '
-        answer=""
-        read -r answer || answer=""
-        case "$answer" in
-            y | Y | yes | YES) ;;
-            *) fail "install them (see docs/pc-build-guide.md for what is needed) and run this again, or run with --install-tools" ;;
-        esac
-    fi
-    if [ -x /opt/homebrew/bin/brew ]; then
-        BREW=/opt/homebrew/bin/brew
-    elif [ -x /usr/local/bin/brew ]; then
-        fail "the Homebrew in /usr/local is the Intel (Rosetta) one and installs x86_64 tools. Install Homebrew for Apple Silicon (it lives in /opt/homebrew, see https://brew.sh) and run this again"
-    else
-        fail "Homebrew is not installed. Install it for Apple Silicon (https://brew.sh, it lives in /opt/homebrew), or install cmake and ninja by hand, and run this again"
-    fi
-    PATH="/opt/homebrew/bin:$PATH"
-    export PATH
-    echo "installing:$missing"
-    # shellcheck disable=SC2086 # $missing is a list of tool names
-    logged install-tools "$BREW" install $missing
-    command -v cmake > /dev/null 2>&1 || fail "cmake is still missing after installing; open a new Terminal window and run this again"
-    command -v ninja > /dev/null 2>&1 || fail "ninja is still missing after installing; open a new Terminal window and run this again"
-fi
-
-cmake_version="$(cmake --version | head -n 1 | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p')"
-version_ge "$cmake_version" 3.25 || fail "CMake 3.25 or newer is needed (found $cmake_version): brew install cmake"
-python_version="$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')"
-version_ge "$python_version" 3.9 || fail "Python 3.9 or newer is needed (found $python_version)"
-has_arm64 cmake || fail "cmake ($(resolve cmake)) has no arm64 slice, it is an Intel build: install the Apple Silicon one (/opt/homebrew)"
-has_arm64 ninja || fail "ninja ($(resolve ninja)) has no arm64 slice, it is an Intel build: install the Apple Silicon one (/opt/homebrew)"
-echo "clang: $cxx_version"
-echo "cmake: $cmake_version, ninja: $(ninja --version), python: $python_version"
+ALLOW_BREW_INSTALL=1
+preflight_tools
 
 # -----------------------------------------------------------------------
 step "2/6 ReXGlue SDK $SDK_TAG with this project's patches"
@@ -162,12 +101,12 @@ fi
 
 # -----------------------------------------------------------------------
 step "3/6 build and install the SDK (the long step, once)"
-if [ ! -x "$INSTALL/bin/rexglue" ] || [ "$MARKER" -nt "$INSTALL/bin/rexglue" ]; then
+if [ ! -x "$INSTALL/bin/rexglue" ] || [ "$MARKER" -nt "$INSTALL/bin/rexglue" ] || [ "$WITH_TESTS" -eq 1 ]; then
     cd "$SDK" || fail "cannot enter $SDK"
     configure_args="-DREXGLUE_ENABLE_TRACY=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 -DCMAKE_C_COMPILER=$CC_BIN -DCMAKE_CXX_COMPILER=$CXX_BIN"
     if [ "$WITH_TESTS" -eq 1 ]; then configure_args="$configure_args -DREXGLUE_BUILD_TESTS=ON"; fi
     # shellcheck disable=SC2086 # configure_args is a list of -D options without spaces in values
-    logged sdk-configure cmake --preset mac-arm64 $configure_args
+    logged sdk-configure cmake --preset mac-arm64 $configure_args ${PPC_BINS:+"-DREXGLUE_PPC_PREBUILT_DIR=$PPC_BINS"}
     # CMake does not cache the host processor; it writes it to CMakeSystem.cmake.
     system_file=""
     for f in out/build/mac-arm64/CMakeFiles/*/CMakeSystem.cmake; do
