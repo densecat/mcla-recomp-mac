@@ -3215,7 +3215,7 @@ index 9933e95..fd85b6c 100644
  catch_discover_tests(ppc_tests
 diff --git a/tests/ppc/asm/instr_fadd_rounding.s b/tests/ppc/asm/instr_fadd_rounding.s
 new file mode 100644
-index 0000000..378b455
+index 0000000..1aba1ac
 --- /dev/null
 +++ b/tests/ppc/asm/instr_fadd_rounding.s
 @@ -0,0 +1,76 @@
@@ -3250,7 +3250,7 @@ index 0000000..378b455
 +  fadd f3, f1, f2
 +  mtfsf 0xFF, f31
 +  blr
-+  #_ REGISTER_OUT f3 -0x1.0p+0
++  #_ REGISTER_OUT f3 -0x1.fffffffffffffp-1
 +
 +test_fadd_rounding_4:
 +  #_ REGISTER_IN f1 -0x1.0p+0
@@ -3261,7 +3261,7 @@ index 0000000..378b455
 +  fadd f3, f1, f2
 +  mtfsf 0xFF, f31
 +  blr
-+  #_ REGISTER_OUT f3 -0x1.0000000000001p+0
++  #_ REGISTER_OUT f3 -0x1.0p+0
 +
 +test_fadd_rounding_5:
 +  #_ REGISTER_IN f1 0x1.0p+0
@@ -3283,7 +3283,7 @@ index 0000000..378b455
 +  fadd f3, f1, f2
 +  mtfsf 0xFF, f31
 +  blr
-+  #_ REGISTER_OUT f3 -0x1.0p+0
++  #_ REGISTER_OUT f3 -0x1.fffffffffffffp-1
 +
 +test_fadd_rounding_7:
 +  #_ REGISTER_IN f1 0x1.0p+0
