@@ -226,12 +226,13 @@ index 0000000..cf54a9c
 +#endif
 diff --git a/include/rex/graphics/metal/render_target_cache.h b/include/rex/graphics/metal/render_target_cache.h
 new file mode 100644
-index 0000000..d79c9e3
+index 0000000..2e34ff8
 --- /dev/null
 +++ b/include/rex/graphics/metal/render_target_cache.h
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,102 @@
 +#pragma once
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++#include <rex/graphics/util/draw_extent_estimator.h>
 +#include <Metal/Metal.hpp>
 +#include <array>
 +#include <map>
@@ -281,6 +282,8 @@ index 0000000..d79c9e3
 +    MTL::Texture* transfer = nullptr;
 +    MTL::Texture* stencil = nullptr;
 +    bool initialized = false;
++    // Rows drawn into this target so far; passes need not load or store below.
++    uint32_t height_used = 0;
 +    // Owned by the real target, reused across transfers/submissions.
 +    std::unique_ptr<Target> depth_snapshot;
 +  };
@@ -318,6 +321,9 @@ index 0000000..d79c9e3
 +  std::array<Target*, 5> bound_{};
 +  std::array<MTL::PixelFormat, 4> colors_{};
 +  uint32_t width_ = 1, height_ = 1, samples_ = 1;
++  // Render area height of the open guest pass (at most height_).
++  uint32_t pass_height_ = 1;
++  DrawExtentEstimator extent_estimator_;
 +  Target* debug_target_ = nullptr;
 +  uint32_t debug_width_ = 0, debug_height_ = 0;
 +  MTL::DepthStencilState* transfer_depth_state_ = nullptr;
@@ -637,6 +643,21 @@ index 0000000..4a5c349
 +std::vector<uint32_t> BuildHostRenderTargetDumpSpirv(
 +    const HostRenderTargetDumpShaderOptions& options);
 +}  // namespace rex::graphics
+diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+index dce3dbf..0f489f9 100644
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -88,6 +88,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
+       uint32_t param_gen_point : 1;
+       // For host render targets - depth / stencil output mode.
+       DepthStencilMode depth_stencil_mode : 3;
++      // Alpha to coverage is disabled for the draw: no sample mask output.
++      // Writing coverage disables early hidden surface removal on tile-based
++      // GPUs. Only the Metal backend sets this.
++      uint32_t no_alpha_to_coverage : 1;
+     } pixel;
+     uint64_t value = 0;
+ 
 diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
 index d26cd4f..807884a 100644
 --- a/include/rex/graphics/pipeline/texture/cache.h
@@ -1177,13 +1198,14 @@ index 6978e3f..8015868 100644
          Vulkan::Headers
 diff --git a/src/graphics/metal/command_processor.cpp b/src/graphics/metal/command_processor.cpp
 new file mode 100644
-index 0000000..1947ddd
+index 0000000..0653967
 --- /dev/null
 +++ b/src/graphics/metal/command_processor.cpp
-@@ -0,0 +1,760 @@
+@@ -0,0 +1,772 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2021-2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
++#include <atomic>
 +#include <rex/graphics/metal/command_processor.h>
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +
@@ -1216,7 +1238,13 @@ index 0000000..1947ddd
 +REXCVAR_DEFINE_BOOL(metal_debug_present_last_rt, false, "GPU",
 +                    "Debug only: display the largest guest color target instead of the frontbuffer");
 +
++REXCVAR_DEFINE_UINT32(metal_ab_period, 0, "GPU/Metal",
++                      "Measurement aid: when non-zero, the option under A/B test is turned off "
++                      "for every other block of this many swaps");
++
 +namespace rex::graphics::metal {
++std::atomic<uint32_t> g_metal_ab_phase{0};
++
 +using ui::metal::Adopt;
 +using ui::metal::ReleaseObject;
 +using T = SpirvShaderTranslator;
@@ -1843,6 +1871,11 @@ index 0000000..1947ddd
 +
 +void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t width, uint32_t height) {
 +  ++swaps_;
++  // Measurement aid: alternate the option under test every metal_ab_period
++  // swaps, so both settings are compared on the same scene in one run.
++  if (uint32_t period = REXCVAR_GET(metal_ab_period)) {
++    g_metal_ab_phase.store(uint32_t((swaps_ / period) & 1), std::memory_order_relaxed);
++  }
 +  auto pool = Adopt(NS::AutoreleasePool::alloc()->init());
 +  auto* presenter = graphics_system_->presenter();
 +  MTL::Texture* source = nullptr;
@@ -2088,10 +2121,11 @@ index 0000000..7959d7e
 +#endif
 diff --git a/src/graphics/metal/msl_shader.cpp b/src/graphics/metal/msl_shader.cpp
 new file mode 100644
-index 0000000..aa48e1e
+index 0000000..c92fdc0
 --- /dev/null
 +++ b/src/graphics/metal/msl_shader.cpp
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,213 @@
++#include <rex/cvar.h>
 +#include <rex/graphics/metal/msl_shader.h>
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +#include <spirv_msl.hpp>
@@ -2100,6 +2134,11 @@ index 0000000..aa48e1e
 +#include <rex/logging.h>
 +#include <rex/perf/counter.h>
 +#include "../../ui/metal/metal_util.h"
++
++
++REXCVAR_DEFINE_BOOL(metal_fast_math, false, "GPU/Metal",
++                    "Compile guest shaders with Metal fast math (MoltenVK enables it unless a "
++                    "shader requests IEEE behaviour)");
 +
 +namespace rex::graphics::metal {
 +namespace cross = SPIRV_CROSS_NAMESPACE;
@@ -2153,7 +2192,7 @@ index 0000000..aa48e1e
 +    std::string entry = compiler.get_cleansed_entry_point_name("main", stage);
 +    auto compile_options = Adopt(MTL::CompileOptions::alloc()->init());
 +    compile_options->setLanguageVersion(MTL::LanguageVersion2_4);
-+    compile_options->setFastMathEnabled(false);
++    compile_options->setFastMathEnabled(REXCVAR_GET(metal_fast_math));
 +    NS::Error* error = nullptr;
 +    result.library = device->newLibrary(NS::String::string(source.c_str(), NS::UTF8StringEncoding),
 +                                        compile_options.get(), &error);
@@ -2301,13 +2340,15 @@ index 0000000..aa48e1e
 +#endif
 diff --git a/src/graphics/metal/pipeline_cache.cpp b/src/graphics/metal/pipeline_cache.cpp
 new file mode 100644
-index 0000000..a509a64
+index 0000000..a539b5a
 --- /dev/null
 +++ b/src/graphics/metal/pipeline_cache.cpp
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,282 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2021-2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
++#include <atomic>
++#include <rex/cvar.h>
 +#include <rex/graphics/metal/pipeline_cache.h>
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +#include <algorithm>
@@ -2321,7 +2362,14 @@ index 0000000..a509a64
 +REXCVAR_DEFINE_BOOL(metal_shader_variant_cache, true, "GPU",
 +                    "Cache Metal shader variants by Shader identity, modification and attachments");
 +
++
++REXCVAR_DEFINE_BOOL(metal_alpha_to_coverage_variants, true, "GPU/Metal",
++                    "Compile pixel shaders without the alpha-to-coverage sample mask for draws "
++                    "that do not enable it, so the GPU keeps hidden surface removal");
++
 +namespace rex::graphics::metal {
++extern std::atomic<uint32_t> g_metal_ab_phase;
++
 +using ui::metal::Adopt;
 +using ui::metal::ErrorText;
 +namespace {
@@ -2471,6 +2519,11 @@ index 0000000..a509a64
 +    m.pixel.param_gen_point =
 +        regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type == xenos::PrimitiveType::kPointList;
 +  }
++  // Emit the alpha-to-coverage sample mask only for draws that enable it.
++  if (REXCVAR_GET(metal_alpha_to_coverage_variants) &&
++      !g_metal_ab_phase.load(std::memory_order_relaxed) &&
++      !regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable)
++    m.pixel.no_alpha_to_coverage = 1;
 +  if (targets_.depth_float24_convert() && depth.z_enable &&
 +      regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
 +    m.pixel.depth_stencil_mode = targets_.depth_float24_round()
@@ -2575,10 +2628,10 @@ index 0000000..a509a64
 +#endif
 diff --git a/src/graphics/metal/render_target_cache.cpp b/src/graphics/metal/render_target_cache.cpp
 new file mode 100644
-index 0000000..922cfa6
+index 0000000..7b95f0f
 --- /dev/null
 +++ b/src/graphics/metal/render_target_cache.cpp
-@@ -0,0 +1,926 @@
+@@ -0,0 +1,949 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
@@ -2598,6 +2651,9 @@ index 0000000..922cfa6
 +
 +REXCVAR_DEFINE_BOOL(metal_merge_transfer_pass, true, "GPU",
 +                    "Continue a compatible sole-attachment transfer pass with guest draws");
++REXCVAR_DEFINE_BOOL(metal_trim_render_area, true, "GPU/Metal",
++                    "Limit each guest render pass to the rows drawn so far instead of the "
++                    "whole EDRAM-sized target, so a tile-based GPU loads and stores less");
 +REXCVAR_DEFINE_BOOL(metal_full_clear_discard, true, "GPU",
 +                    "Discard old attachment contents only for exact full-surface resolve clears");
 +
@@ -2666,7 +2722,8 @@ index 0000000..922cfa6
 +      gamma_unorm16_(REXCVAR_GET(gamma_render_target_as_unorm16)),
 +      depth_float24_convert_(REXCVAR_GET(depth_float24_convert_in_pixel_shader)),
 +      depth_float24_round_(REXCVAR_GET(depth_float24_round)),
-+      native_2x_(REXCVAR_GET(native_2x_msaa) && device->supportsTextureSampleCount(2)) {
++      native_2x_(REXCVAR_GET(native_2x_msaa) && device->supportsTextureSampleCount(2)),
++      extent_estimator_(regs, memory) {
 +  InitializeCommon();
 +}
 +MetalRenderTargetCache::~MetalRenderTargetCache() {
@@ -2787,9 +2844,26 @@ index 0000000..922cfa6
 +  uint32_t width = std::max(1u, RenderTargetKey::GetWidth(pitch, surface.msaa_samples));
 +  uint32_t height = std::max(1u, GetRenderTargetHeight(pitch, surface.msaa_samples));
 +  uint32_t samples = Samples(surface.msaa_samples);
++  // Xenos render targets have no height, so host targets span every EDRAM
++  // row the pitch allows (1280x1024 for a 1280x720 2x MSAA scene). A tile-based
++  // GPU loads and stores the whole render area of every pass, so the area is
++  // cut to the rows drawn so far; rows outside it are left untouched.
++  uint32_t used = height;
++  if (REXCVAR_GET(metal_trim_render_area)) {
++    used = std::min(height, (std::max(1u, extent_estimator_.EstimateMaxY(true, vs)) + 15) & ~15u);
++  }
++  uint32_t pass_height = 0;
++  for (auto* rt : targets) {
++    if (!rt) continue;
++    rt->height_used = std::max(rt->height_used, used);
++    pass_height = std::max(pass_height, rt->initialized ? rt->height_used : height);
++  }
++  pass_height = std::max(1u, std::min(pass_height ? pass_height : height, height));
 +  if (transfers) submission_.EndEncoding(perf::CounterId::kPassEndTransfer);
 +  else if (bound_ != targets || width_ != width || height_ != height || samples_ != samples)
 +    submission_.EndEncoding(perf::CounterId::kPassEndRtChange);
++  else if (submission_.encoder && pass_height > pass_height_)
++    submission_.EndEncoding(perf::CounterId::kPassEndOther);
 +  for (uint32_t i = 0; i < targets.size(); ++i) {
 +    MTL::RenderCommandEncoder* transfer_encoder = nullptr;
 +    for (const auto& transfer : last_update_transfers()[i]) {
@@ -2831,12 +2905,14 @@ index 0000000..922cfa6
 +      METAL_GPU_LABEL(GpuWork(transfer_encoder, "guest", 0, "draws"));
 +      submission_.SetRenderEncoder(transfer_encoder);
 +      transfer_encoder = nullptr;
++      pass_height = height;  // The utility pass covers the full height.
 +      PERF_METAL_counter_add(kMetalTransferPassesMerged, 1);
 +    }
 +    EndUtilityPass(transfer_encoder, false);
 +  }
 +  bound_ = targets;
 +  width_ = width; height_ = height; samples_ = samples;
++  if (!submission_.encoder) pass_height_ = pass_height;
 +  for (uint32_t i = 0; i < colors_.size(); ++i)
 +    colors_[i] = bound_[i + 1] ? bound_[i + 1]->texture->pixelFormat() : MTL::PixelFormatInvalid;
 +  return BeginPass();
@@ -2848,7 +2924,7 @@ index 0000000..922cfa6
 +  }
 +  auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
 +  pass->setRenderTargetWidth(width_);
-+  pass->setRenderTargetHeight(height_);
++  pass->setRenderTargetHeight(std::min(pass_height_, height_));
 +  pass->setDefaultRasterSampleCount(samples_);
 +  for (uint32_t i = 0; i < bound_.size(); ++i) {
 +    auto* rt = bound_[i];
@@ -4954,6 +5030,20 @@ index 0000000..b42d9df
 +}
 +}  // namespace rex::graphics::metal
 +#endif
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 1774f97..c77c1a0 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -2892,7 +2892,8 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
+       float24_depth_conversion && !current_shader().writes_depth();
+   bool alpha_to_coverage_possible = !is_depth_only_fragment_shader_ &&
+                                     current_shader().writes_color_target(0) &&
+-                                    !IsExecutionModeEarlyFragmentTests();
++                                    !IsExecutionModeEarlyFragmentTests() &&
++                                    !GetSpirvShaderModification().pixel.no_alpha_to_coverage;
+ 
+   // Fragment coordinates.
+   // TODO(Triang3l): More conditions - alpha to coverage (if RT 0 is written,
 diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
 index 210f77f..c02a5e2 100644
 --- a/src/graphics/pipeline/texture/cache.cpp
