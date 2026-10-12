@@ -136,7 +136,7 @@ index 0000000..d0e738f
 +#endif
 diff --git a/include/rex/graphics/metal/msl_shader.h b/include/rex/graphics/metal/msl_shader.h
 new file mode 100644
-index 0000000..8bedfd4
+index 0000000..b2be53d
 --- /dev/null
 +++ b/include/rex/graphics/metal/msl_shader.h
 @@ -0,0 +1,20 @@
@@ -157,21 +157,22 @@ index 0000000..8bedfd4
 +// Keep SPIRV-Cross's SPIR-V header separate from glslang's header.
 +bool CompileMSL(MTL::Device* device, const std::vector<uint8_t>& binary,
 +                bool vertex, uint32_t texture_count, uint32_t sampler_count,
-+                MetalFunction& result);
++                MetalFunction& result, uint32_t attachment_mask = 31);
 +}  // namespace rex::graphics::metal
 +#endif
 diff --git a/include/rex/graphics/metal/pipeline_cache.h b/include/rex/graphics/metal/pipeline_cache.h
 new file mode 100644
-index 0000000..10344fd
+index 0000000..62e6f74
 --- /dev/null
 +++ b/include/rex/graphics/metal/pipeline_cache.h
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,38 @@
 +#pragma once
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +#include <array>
 +#include <map>
 +#include <memory>
 +#include <rex/graphics/metal/msl_shader.h>
++#include <rex/graphics/metal/render_target_cache.h>
 +#include <rex/graphics/pipeline/shader/spirv.h>
 +#include <rex/graphics/primitive_processor.h>
 +#include <rex/graphics/register_file.h>
@@ -179,33 +180,111 @@ index 0000000..10344fd
 +namespace rex::graphics::metal {
 +class MetalPipelineCache {
 + public:
-+  explicit MetalPipelineCache(MTL::Device* device);
++  MetalPipelineCache(MTL::Device* device, const MetalRenderTargetCache& targets);
 +  ~MetalPipelineCache();
-+  MetalFunction* GetShader(SpirvShader& shader, uint64_t modification);
++  MetalFunction* GetShader(SpirvShader& shader, uint64_t modification, uint32_t attachments = 31);
++  MetalFunction* GetDepthOnlyShader();
 +  uint64_t VertexModification(const RegisterFile& regs, const SpirvShader& shader,
 +      Shader::HostVertexShaderType type, uint32_t interpolators, bool param_gen) const;
 +  uint64_t PixelModification(const RegisterFile& regs, const SpirvShader& shader,
-+      uint32_t interpolators, uint32_t param_gen) const;
++      uint32_t interpolators, uint32_t param_gen, reg::RB_DEPTHCONTROL depth) const;
 +  MTL::RenderPipelineState* GetPipeline(const RegisterFile& regs, const MetalFunction& vs,
 +      const MetalFunction* ps, xenos::PrimitiveType primitive, uint32_t color_mask,
-+      bool rasterize, MTL::PixelFormat color, MTL::PixelFormat depth, uint32_t samples);
++      bool rasterize);
 +  MTL::DepthStencilState* GetDepthState(const RegisterFile& regs, bool polygonal,
 +                                       reg::RB_DEPTHCONTROL depth);
 + private:
 +  MTL::Device* device_;
++  const MetalRenderTargetCache& targets_;
 +  SpirvShaderTranslator translator_;
-+  std::map<std::array<uint64_t, 3>, std::unique_ptr<MetalFunction>> shaders_;
-+  std::map<std::array<uint64_t, 12>, MTL::RenderPipelineState*> pipelines_;
++  std::array<std::unique_ptr<MetalFunction>, 2> depth_only_{};
++  std::map<std::array<uint64_t, 4>, std::unique_ptr<MetalFunction>> shaders_;
++  std::map<std::array<uint64_t, 18>, MTL::RenderPipelineState*> pipelines_;
 +  std::map<std::array<uint32_t, 3>, MTL::DepthStencilState*> depths_;
++};
++}  // namespace rex::graphics::metal
++#endif
+diff --git a/include/rex/graphics/metal/render_target_cache.h b/include/rex/graphics/metal/render_target_cache.h
+new file mode 100644
+index 0000000..6ebf11e
+--- /dev/null
++++ b/include/rex/graphics/metal/render_target_cache.h
+@@ -0,0 +1,69 @@
++#pragma once
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++#include <Metal/Metal.hpp>
++#include <array>
++#include <map>
++#include <rex/graphics/metal/resources.h>
++#include <rex/graphics/pipeline/render_target/cache.h>
++
++namespace rex::graphics::metal {
++class MetalRenderTargetCache final : public RenderTargetCache {
++ public:
++  MetalRenderTargetCache(const RegisterFile& regs, const memory::Memory& memory,
++                        MTL::Device* device, MetalSubmission& submission);
++  ~MetalRenderTargetCache() override;
++  Path GetPath() const override { return Path::kHostRenderTargets; }
++  void ClearCache() override;
++  void BeginFrame() override;
++  bool Update(bool rasterize, reg::RB_DEPTHCONTROL depth, uint32_t color_mask,
++              const Shader& vertex_shader) override;
++  const std::array<MTL::PixelFormat, 4>& color_formats() const { return colors_; }
++  MTL::PixelFormat depth_format() const;
++  uint32_t samples() const { return samples_; }
++  uint32_t width() const { return width_; }
++  uint32_t height() const { return height_; }
++  bool gamma_unorm16() const { return gamma_unorm16_; }
++  bool depth_float24_convert() const { return depth_float24_convert_; }
++  bool depth_float24_round() const { return depth_float24_round_; }
++  void MarkDraw(uint32_t color_mask, uint32_t width, uint32_t height);
++  bool has_debug_target() const { return debug_target_ != nullptr; }
++  // Encodes only. The presenter owns commit/wait and publishes after completion.
++  bool DebugPresent(MTL::CommandBuffer* buffer, MTL::Texture* output);
++
++ protected:
++  bool IsGammaFormatHostStorageSeparate() const override { return gamma_unorm16_; }
++  bool IsHostDepthEncodingDifferent(xenos::DepthRenderTargetFormat format) const override;
++  uint32_t GetMaxRenderTargetWidth() const override { return 16384; }
++  uint32_t GetMaxRenderTargetHeight() const override { return 16384; }
++  RenderTarget* CreateRenderTarget(RenderTargetKey key) override;
++
++ private:
++  struct Target final : RenderTarget {
++    explicit Target(RenderTargetKey key) : RenderTarget(key) {}
++    ~Target() override;
++    MTL::Texture* texture = nullptr;
++    MTL::Texture* transfer = nullptr;
++    MTL::Texture* stencil = nullptr;
++    bool initialized = false;
++  };
++  MTL::PixelFormat ColorFormat(xenos::ColorRenderTargetFormat format) const;
++  static MTL::PixelFormat TransferFormat(xenos::ColorRenderTargetFormat format);
++  uint32_t Samples(xenos::MsaaSamples samples) const;
++  MTL::RenderPipelineState* TransferPipeline(const Target& source, const Target& dest,
++                                            bool host_depth, bool preview);
++  bool TransferTo(Target& dest, const Transfer& transfer);
++  bool BeginPass();
++  MTL::Device* device_;
++  MetalSubmission& submission_;
++  const bool gamma_unorm16_, depth_float24_convert_, depth_float24_round_, native_2x_;
++  std::array<Target*, 5> bound_{};
++  std::array<MTL::PixelFormat, 4> colors_{};
++  uint32_t width_ = 1, height_ = 1, samples_ = 1;
++  Target* debug_target_ = nullptr;
++  uint32_t debug_width_ = 0, debug_height_ = 0;
++  MTL::DepthStencilState* transfer_depth_state_ = nullptr;
++  std::map<std::array<uint32_t, 6>, MTL::RenderPipelineState*> transfer_pipelines_;
++  bool transfer_warning_logged_ = false;
 +};
 +}  // namespace rex::graphics::metal
 +#endif
 diff --git a/include/rex/graphics/metal/resources.h b/include/rex/graphics/metal/resources.h
 new file mode 100644
-index 0000000..8db20a2
+index 0000000..533cdfd
 --- /dev/null
 +++ b/include/rex/graphics/metal/resources.h
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,91 @@
 +#pragma once
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +
@@ -213,6 +292,7 @@ index 0000000..8db20a2
 +#include <array>
 +#include <deque>
 +#include <vector>
++#include <rex/perf/counter.h>
 +#include <rex/graphics/primitive_processor.h>
 +#include <rex/graphics/shared_memory.h>
 +
@@ -224,10 +304,10 @@ index 0000000..8db20a2
 +  ~MetalSubmission();
 +  bool Initialize();
 +  bool Begin();
-+  bool Submit();
++  bool Submit(perf::CounterId reason = perf::CounterId::kPassEndOther);
 +  bool Poll();
 +  bool BeforeUpload(uint64_t last_use);
-+  void EndEncoding();
++  void EndEncoding(perf::CounterId reason = perf::CounterId::kPassEndOther);
 +  void Finish();
 +  bool AllocateConstants(size_t size, MTL::Buffer*& buffer, size_t& offset);
 +  uint64_t epoch() const { return epoch_; }
@@ -297,10 +377,10 @@ index 0000000..8db20a2
 +}  // namespace rex::graphics::metal
 +#endif
 diff --git a/include/rex/perf/counter.h b/include/rex/perf/counter.h
-index 829046d..0cd5f0c 100644
+index 829046d..e78cfa0 100644
 --- a/include/rex/perf/counter.h
 +++ b/include/rex/perf/counter.h
-@@ -75,6 +75,14 @@ enum class CounterId : uint16_t {
+@@ -75,6 +75,16 @@ enum class CounterId : uint16_t {
    kUploadPlannedOtherBytes,
    kUploadPlannedHotBytes,
  
@@ -311,11 +391,13 @@ index 829046d..0cd5f0c 100644
 +  kMetalSplitForUpload,
 +  kMetalUploadWaitUs,
 +  kMetalPlaceholderTextureDraws,
++  kMetalRtTransfersSkipped,
++  kMetalRenderTargetsCreated,
 +
    kCount  // sentinel -- must be last
  };
  
-@@ -219,3 +227,9 @@ class Profiler {
+@@ -219,3 +229,9 @@ class Profiler {
  #else
  #define PERF_VULKAN_counter_add(id, delta)
  #endif
@@ -514,10 +596,10 @@ index 3e873dc..29d4d66 100644
  if(REXGLUE_ENABLE_TRACY)
      target_link_libraries(rexcore PUBLIC
 diff --git a/src/core/perf/counter.cpp b/src/core/perf/counter.cpp
-index 3b0cfef..02ca727 100644
+index 3b0cfef..c7420b4 100644
 --- a/src/core/perf/counter.cpp
 +++ b/src/core/perf/counter.cpp
-@@ -69,6 +69,12 @@ constexpr const char* kCounterNames[] = {
+@@ -69,6 +69,14 @@ constexpr const char* kCounterNames[] = {
      "upload_planned_explicit_bytes",
      "upload_planned_other_bytes",
      "upload_planned_hot_bytes",
@@ -527,10 +609,12 @@ index 3b0cfef..02ca727 100644
 +    "metal_split_for_upload",
 +    "metal_upload_wait_us",
 +    "metal_placeholder_texture_draws",
++    "metal_rt_transfers_skipped",
++    "metal_render_targets_created",
  };
  static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
  
-@@ -112,6 +118,12 @@ constexpr bool kIsGauge[] = {
+@@ -112,6 +120,14 @@ constexpr bool kIsGauge[] = {
      false,  // kUploadPlannedExplicitBytes
      false,  // kUploadPlannedOtherBytes
      false,  // kUploadPlannedHotBytes
@@ -540,14 +624,16 @@ index 3b0cfef..02ca727 100644
 +    false,  // kMetalSplitForUpload
 +    false,  // kMetalUploadWaitUs
 +    false,  // kMetalPlaceholderTextureDraws
++    false,  // kMetalRtTransfersSkipped
++    false,  // kMetalRenderTargetsCreated
  };
  static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
  
 diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
-index 6978e3f..fc904a9 100644
+index 6978e3f..24f5e62 100644
 --- a/src/graphics/CMakeLists.txt
 +++ b/src/graphics/CMakeLists.txt
-@@ -96,6 +96,16 @@ if(REXGLUE_USE_D3D12)
+@@ -96,6 +96,17 @@ if(REXGLUE_USE_D3D12)
          ${REXGPU_XENOS_D3D12_SOURCES})
  endif()
  
@@ -558,13 +644,14 @@ index 6978e3f..fc904a9 100644
 +        metal/resources.cpp
 +        metal/msl_shader.cpp
 +        metal/pipeline_cache.cpp
++        metal/render_target_cache.cpp
 +    )
 +endif()
 +
  # On PS5 the GPU implementation is linked in, not loaded as a plugin.
  if(PS5)
      add_library(rexgpu-xenos STATIC ${REXGPU_XENOS_SOURCES})
-@@ -143,6 +153,19 @@ target_link_libraries(rexgpu-xenos PRIVATE
+@@ -143,6 +154,19 @@ target_link_libraries(rexgpu-xenos PRIVATE
      xxHash::xxhash
  )
  
@@ -586,10 +673,10 @@ index 6978e3f..fc904a9 100644
          Vulkan::Headers
 diff --git a/src/graphics/metal/command_processor.cpp b/src/graphics/metal/command_processor.cpp
 new file mode 100644
-index 0000000..975318b
+index 0000000..fa6f13c
 --- /dev/null
 +++ b/src/graphics/metal/command_processor.cpp
-@@ -0,0 +1,530 @@
+@@ -0,0 +1,522 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2021-2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
@@ -606,6 +693,7 @@ index 0000000..975318b
 +#include <rex/graphics/graphics_system.h>
 +#include <rex/graphics/metal/resources.h>
 +#include <rex/graphics/metal/pipeline_cache.h>
++#include <rex/graphics/metal/render_target_cache.h>
 +#include <rex/graphics/util/draw.h>
 +#include <rex/graphics/util/draw_extent_estimator.h>
 +#include <rex/logging.h>
@@ -614,6 +702,9 @@ index 0000000..975318b
 +#include <rex/ui/metal/presenter.h>
 +#include <rex/ui/metal/provider.h>
 +#include "../../ui/metal/metal_util.h"
++
++REXCVAR_DEFINE_BOOL(metal_debug_present_last_rt, true, "GPU",
++                    "Display the largest guest color target used this frame until resolves exist");
 +
 +namespace rex::graphics::metal {
 +using ui::metal::Adopt;
@@ -625,24 +716,22 @@ index 0000000..975318b
 +  MetalSubmission submission;
 +  MetalSharedMemory shared;
 +  MetalPrimitiveProcessor primitives;
++  MetalRenderTargetCache targets;
 +  MetalPipelineCache pipelines;
 +  DrawExtentEstimator extent;
-+  MTL::Texture* color = nullptr;
-+  MTL::Texture* depth = nullptr;
 +  std::array<MTL::Texture*, 6> placeholders{};
 +  MTL::SamplerState* sampler = nullptr;
-+  bool fresh_target = false;
++  bool debug_present_logged = false;
 +  string::StringBuffer disassembly;
 +
 +  State(MTL::Device* d, MTL::CommandQueue* queue, const RegisterFile& regs, memory::Memory& memory)
 +      : device(d), submission(d, queue), shared(memory, submission),
-+        primitives(regs, memory, shared, d), pipelines(d), extent(regs, memory) {}
++        primitives(regs, memory, shared, d), targets(regs, memory, d, submission),
++        pipelines(d, targets), extent(regs, memory) {}
 +  ~State() {
 +    submission.Finish();
 +    for (auto*& texture : placeholders) ReleaseObject(texture);
 +    ReleaseObject(sampler);
-+    ReleaseObject(color);
-+    ReleaseObject(depth);
 +  }
 +  bool Initialize() {
 +    if (device->maxBufferLength() < SharedMemory::kBufferSize ||
@@ -673,50 +762,6 @@ index 0000000..975318b
 +    sampler = device->newSamplerState(desc.get());
 +    return sampler != nullptr;
 +  }
-+  bool Target(uint32_t width, uint32_t height, uint32_t samples) {
-+    if (color && color->width() == width && color->height() >= height &&
-+        color->sampleCount() == samples) return true;
-+    if (!device->supportsTextureSampleCount(samples)) return false;
-+    submission.EndEncoding();
-+    auto desc = Adopt(MTL::TextureDescriptor::alloc()->init());
-+    desc->setTextureType(samples > 1 ? MTL::TextureType2DMultisample : MTL::TextureType2D);
-+    desc->setWidth(width); desc->setHeight(height); desc->setSampleCount(samples);
-+    desc->setStorageMode(MTL::StorageModePrivate);
-+    desc->setUsage(MTL::TextureUsageRenderTarget);
-+    desc->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
-+    auto new_color = Adopt(device->newTexture(desc.get()));
-+    desc->setPixelFormat(MTL::PixelFormatDepth32Float_Stencil8);
-+    auto new_depth = Adopt(device->newTexture(desc.get()));
-+    if (!new_color || !new_depth) return false;
-+    ReleaseObject(color); ReleaseObject(depth);
-+    color = new_color.release(); depth = new_depth.release();
-+    fresh_target = true;
-+    return true;
-+  }
-+  bool RenderPass() {
-+    if (!submission.Begin()) return false;
-+    if (submission.encoder) return true;
-+    auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
-+    auto* c = pass->colorAttachments()->object(0);
-+    c->setTexture(color);
-+    c->setLoadAction(fresh_target ? MTL::LoadActionClear : MTL::LoadActionLoad);
-+    c->setStoreAction(MTL::StoreActionStore);
-+    c->setClearColor(MTL::ClearColor(0, 0, 0, 1));
-+    pass->depthAttachment()->setTexture(depth);
-+    pass->depthAttachment()->setLoadAction(fresh_target ? MTL::LoadActionClear : MTL::LoadActionLoad);
-+    pass->depthAttachment()->setStoreAction(MTL::StoreActionStore);
-+    pass->depthAttachment()->setClearDepth(1);
-+    pass->stencilAttachment()->setTexture(depth);
-+    pass->stencilAttachment()->setLoadAction(fresh_target ? MTL::LoadActionClear : MTL::LoadActionLoad);
-+    pass->stencilAttachment()->setStoreAction(MTL::StoreActionStore);
-+    pass->stencilAttachment()->setClearStencil(0);
-+    submission.encoder = submission.buffer()->renderCommandEncoder(pass);
-+    if (!submission.encoder) return false;
-+    submission.encoder->retain();
-+    fresh_target = false;
-+    PERF_METAL_counter_add(kRenderPassesBegun, 1);
-+    return true;
-+  }
 +  void BindTextures(const SpirvShader& shader, bool vertex) {
 +    auto* encoder = submission.encoder;
 +    const auto& textures = shader.GetTextureBindingsAfterTranslation();
@@ -737,7 +782,8 @@ index 0000000..975318b
 +
 +namespace {
 +T::SystemConstants SystemConstants(const RegisterFile& regs,
-+    const PrimitiveProcessor::ProcessingResult& p, const draw_util::ViewportInfo& vp, bool polygonal) {
++    const PrimitiveProcessor::ProcessingResult& p, const draw_util::ViewportInfo& vp, bool polygonal,
++    const MetalRenderTargetCache& targets) {
 +  T::SystemConstants c{};
 +  const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
 +  const auto clip = regs.Get<reg::PA_CL_CLIP_CNTL>();
@@ -785,8 +831,13 @@ index 0000000..975318b
 +  c.alpha_to_mask = control.alpha_to_mask_enable ? (control.value >> 24) | 256 : 0;
 +  for (uint32_t i = 0; i < 4; ++i) {
 +    auto info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
-+    c.color_exp_bias[i] = std::ldexp(1.0f, info.color_exp_bias);
-+    if (info.color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)
++    int32_t bias = info.color_exp_bias;
++    if (REXCVAR_GET(snorm16_render_target_full_range) &&
++        (info.color_format == xenos::ColorRenderTargetFormat::k_16_16 ||
++         info.color_format == xenos::ColorRenderTargetFormat::k_16_16_16_16)) bias -= 5;
++    c.color_exp_bias[i] = std::ldexp(1.0f, bias);
++    if (!targets.gamma_unorm16() &&
++        info.color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)
 +      c.flags |= T::kSysFlag_ConvertColor0ToGamma << i;
 +  }
 +  return c;
@@ -818,15 +869,15 @@ index 0000000..975318b
 +  if (!provider || !provider->device() || !provider->queue()) return false;
 +  state_ = std::make_unique<State>(provider->device(), provider->queue(), *register_file_, *memory_);
 +  if (!state_->Initialize()) {
-+    REXLOG_ERROR("Metal M2a initialization failed");
++    REXLOG_ERROR("Metal M2b initialization failed");
 +    state_.reset();
 +    return false;
 +  }
-+  REXLOG_WARN("Metal M2a: scratch color/depth draws; placeholder textures; copies and queries remain stubbed");
++  REXLOG_WARN("Metal M2b: guest host render targets; placeholder textures; resolves and queries remain stubbed");
 +  return true;
 +}
 +void MetalCommandProcessor::ShutdownContext() {
-+  REXLOG_INFO("Metal M2a counts: draws={}, rejected={}, copies={}, swaps={}, base-query-packets={}",
++  REXLOG_INFO("Metal M2b counts: draws={}, rejected={}, copies={}, swaps={}, base-query-packets={}",
 +              draws_, rejected_draws_, copies_, swaps_, query_packets_);
 +  auto pool = Adopt(NS::AutoreleasePool::alloc()->init());
 +  state_.reset();
@@ -840,6 +891,7 @@ index 0000000..975318b
 +    state_->submission.Submit();
 +    state_->primitives.EndFrame();
 +    state_->shared.ClearCache();
++    state_->targets.ClearCache();
 +  });
 +}
 +void MetalCommandProcessor::InvalidateGpuMemory() {
@@ -910,14 +962,13 @@ index 0000000..975318b
 +    case xenos::PrimitiveType::kTriangleStrip: primitive = MTL::PrimitiveTypeTriangleStrip; break;
 +    default: return fail("unsupported host topology");
 +  }
++  auto depth_control = draw_util::GetNormalizedDepthControl(regs);
 +  uint32_t param_gen = UINT32_MAX;
 +  uint32_t interpolators = ps ? vs->writes_interpolators() & ps->GetInterpolatorInputMask(
 +      regs.Get<reg::SQ_PROGRAM_CNTL>(), regs.Get<reg::SQ_CONTEXT_MISC>(), param_gen) : 0;
 +  auto* vertex = s.pipelines.GetShader(*vs, s.pipelines.VertexModification(
 +      regs, *vs, p.host_vertex_shader_type, interpolators, param_gen != UINT32_MAX));
-+  auto* pixel = ps ? s.pipelines.GetShader(*ps, s.pipelines.PixelModification(
-+      regs, *ps, interpolators, param_gen)) : nullptr;
-+  if (!vertex || (ps && !pixel)) return fail("shader translation/compilation");
++  if (!vertex) return fail("vertex shader translation/compilation");
 +
 +  std::vector<std::pair<uint32_t, uint32_t>> reads, writes;
 +  const auto& constants = vs->constant_register_map();
@@ -951,33 +1002,21 @@ index 0000000..975318b
 +  // Process already requested DMA indices; do not snapshot hot pages twice.
 +  if (guest_indices) reads.emplace_back(p.guest_index_base, p.guest_draw_vertex_count *
 +      (regs.Get<reg::VGT_DRAW_INITIATOR>().index_size == xenos::IndexFormat::kInt16 ? 2u : 4u));
-+  auto depth_control = draw_util::GetNormalizedDepthControl(regs);
 +  draw_util::ViewportInfo viewport;
 +  // Metal NDC Y points up. The helper supplies the corresponding shader Y flip.
 +  draw_util::GetHostViewportInfo(regs, 1, 1, true, 16384, 16384, false,
-+                                depth_control, false, false, ps && ps->writes_depth(), viewport);
++                                depth_control, s.targets.depth_float24_convert(), true,
++                                ps && ps->writes_depth(), viewport);
 +  draw_util::Scissor scissor;
 +  draw_util::GetScissor(regs, scissor);
-+  uint32_t width = std::clamp(uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch), 1u, 8192u);
-+  // RB_SURFACE_INFO has pitch and samples, not height. Use guest viewport/scissor extent.
++  uint32_t width = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
 +  uint32_t height = std::clamp(s.extent.EstimateMaxY(false, *vs), 1u, 8192u);
-+  uint32_t samples = 1u << uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples);
-+  if (samples == 2 && (!REXCVAR_GET(native_2x_msaa) || !s.device->supportsTextureSampleCount(2)))
-+    samples = 4;  // Same 2x-in-4x shader sample mapping as Vulkan.
-+  if (!s.Target(width, height, samples)) return fail("scratch attachments");
-+  scissor.offset[0] = std::min(scissor.offset[0], width);
-+  scissor.offset[1] = std::min(scissor.offset[1], height);
-+  scissor.extent[0] = std::min(scissor.extent[0], width - scissor.offset[0]);
-+  scissor.extent[1] = std::min(scissor.extent[1], height - scissor.offset[1]);
-+  if (!viewport.xy_extent[0] || !viewport.xy_extent[1] || !scissor.extent[0] || !scissor.extent[1]) {
++  if (!width || !viewport.xy_extent[0] || !viewport.xy_extent[1] ||
++      !scissor.extent[0] || !scissor.extent[1]) {
 +    rasterize = false;
 +    if (!vs->memexport_eM_written()) return true;
 +  }
 +  uint32_t color_mask = ps ? draw_util::GetNormalizedColorMask(regs, ps->writes_color_targets()) : 0;
-+  auto* pipeline = s.pipelines.GetPipeline(regs, *vertex, pixel, p.host_primitive_type, color_mask,
-+      rasterize, s.color->pixelFormat(), s.depth->pixelFormat(), samples);
-+  auto* depth_state = s.pipelines.GetDepthState(regs, polygonal, depth_control);
-+  if (!pipeline || !depth_state) return fail("pipeline state");
 +
 +  std::pair<MTL::Buffer*, size_t> indices{};
 +  auto index_snapshot = Adopt(static_cast<MTL::Buffer*>(nullptr));
@@ -989,7 +1028,7 @@ index 0000000..975318b
 +                    (p.host_index_format == xenos::IndexFormat::kInt16 ? 2 : 4);
 +      index_snapshot = Adopt(s.device->newBuffer(size, MTL::ResourceStorageModePrivate));
 +      if (!index_snapshot) return fail("index snapshot allocation");
-+      s.submission.EndEncoding();
++      s.submission.EndEncoding(perf::CounterId::kPassEndMemexport);
 +      auto* blit = s.submission.buffer()->blitCommandEncoder();
 +      if (!blit) return fail("index snapshot encoder");
 +      blit->copyFromBuffer(indices.first, indices.second, index_snapshot.get(), 0, size);
@@ -1007,15 +1046,42 @@ index 0000000..975318b
 +  MTL::Buffer* uniforms;
 +  size_t base;
 +  if (!s.submission.AllocateConstants(total, uniforms, base)) return fail("uniform ring");
++  // Uploads, index snapshots and uniform rollover have all finished. Update can
++  // retain the current encoder or transfer ownership and open a different pass.
++  if (!s.targets.Update(rasterize, depth_control, color_mask, *vs)) return fail("guest targets");
++  for (uint32_t i = 0; i < 2; ++i) {
++    uint32_t limit = i ? s.targets.height() : s.targets.width();
++    scissor.offset[i] = std::min(scissor.offset[i], limit);
++    scissor.extent[i] = std::min(scissor.extent[i], limit - scissor.offset[i]);
++  }
++  if (!scissor.extent[0] || !scissor.extent[1]) {
++    rasterize = false;
++    if (!vs->memexport_eM_written()) return true;
++  }
++  uint32_t attachments = s.targets.depth_format() != MTL::PixelFormatInvalid ? 1 : 0;
++  for (uint32_t i = 0; i < 4; ++i)
++    if (s.targets.color_formats()[i] != MTL::PixelFormatInvalid) attachments |= 2u << i;
++  auto* pixel = ps ? s.pipelines.GetShader(*ps, s.pipelines.PixelModification(
++      regs, *ps, interpolators, param_gen, depth_control), attachments) : nullptr;
++  bool depth_only = !ps && rasterize && (attachments & 1) && depth_control.z_enable &&
++      s.targets.depth_float24_convert() &&
++      regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24FS8;
++  if (depth_only) pixel = s.pipelines.GetDepthOnlyShader();
++  if ((ps || depth_only) && !pixel) return fail("pixel shader translation/compilation");
++  auto* pipeline = s.pipelines.GetPipeline(regs, *vertex, pixel, p.host_primitive_type,
++                                           color_mask, rasterize);
++  auto effective_depth = depth_control;
++  if (!(attachments & 1)) effective_depth.value = 0;
++  auto* depth_state = s.pipelines.GetDepthState(regs, polygonal, effective_depth);
++  if (!pipeline || !depth_state) return fail("pipeline state");
 +  auto* data = static_cast<uint8_t*>(uniforms->contents()) + base;
 +  std::memset(data, 0, total);
-+  auto system = SystemConstants(regs, p, viewport, polygonal);
++  auto system = SystemConstants(regs, p, viewport, polygonal, s.targets);
 +  std::memcpy(data, &system, sizeof(system));
 +  FloatConstants(data + offsets[1], regs, vs, false);
 +  FloatConstants(data + offsets[2], regs, ps, true);
 +  std::memcpy(data + offsets[3], &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], 160);
 +  std::memcpy(data + offsets[4], &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 768);
-+  if (!s.RenderPass()) return fail("render encoder");
 +  auto* e = s.submission.encoder;
 +  e->setRenderPipelineState(pipeline);
 +  e->setDepthStencilState(depth_state);
@@ -1067,6 +1133,7 @@ index 0000000..975318b
 +  } else {
 +    e->drawPrimitives(primitive, NS::UInteger(0), NS::UInteger(p.host_draw_vertex_count));
 +  }
++  if (rasterize) s.targets.MarkDraw(color_mask, width, height);
 +  PERF_METAL_counter_add(kDrawCalls, 1);
 +  PERF_METAL_counter_add(kVerticesProcessed, p.host_draw_vertex_count);
 +  PERF_METAL_counter_add(kMetalDrawsEncoded, 1);
@@ -1078,39 +1145,51 @@ index 0000000..975318b
 +    s.shared.RangeWrittenByGpu(start, size);
 +  }
 +  // Tracked Metal resources order memexport against subsequent render/blit encoders.
-+  if (memexport) s.submission.EndEncoding();
++  if (memexport) s.submission.EndEncoding(perf::CounterId::kPassEndMemexport);
 +  return true;
 +}
 +bool MetalCommandProcessor::IssueCopy() {
 +  ++copies_;
-+  return true;  // EDRAM resolves belong to milestone 2b/3.
++  return true;  // Guest resolves / IssueCopy to memory belong to milestone 4.
 +}
 +
 +void MetalCommandProcessor::IssueSwap(uint32_t, uint32_t width, uint32_t height) {
 +  ++swaps_;
 +  auto pool = Adopt(NS::AutoreleasePool::alloc()->init());
++  bool submitted = true;
 +  if (state_) {
-+    state_->submission.Submit();
++    submitted = state_->submission.Submit(perf::CounterId::kPassEndSwap);
 +    state_->primitives.EndFrame();
-+    state_->fresh_target = true;
 +    if (REXCVAR_GET(clear_memory_page_state))
 +      state_->shared.SetSystemPageBlocksValidWithGpuDataWritten();
 +  }
 +  auto* presenter = graphics_system_->presenter();
-+  if (!presenter) return;  // Headless guest GPU.
-+  if (!width || !height) {
-+    presenter->RefreshGuestOutput(0, 0, 0, 0, {});
++  if (!presenter || !width || !height) {
++    if (presenter) presenter->RefreshGuestOutput(0, 0, 0, 0, {});
++    if (state_) state_->targets.BeginFrame();
 +    return;
 +  }
 +  double phase = std::chrono::duration<double>(
 +      std::chrono::steady_clock::now().time_since_epoch()).count() * 0.25;
-+  bool refreshed = presenter->RefreshGuestOutput(width, height, width, height,
-+      [phase](ui::Presenter::GuestOutputRefreshContext& context) {
++  bool refreshed = submitted && presenter->RefreshGuestOutput(width, height, width, height,
++      [this, phase](ui::Presenter::GuestOutputRefreshContext& context) {
 +        auto& metal = static_cast<ui::metal::MetalGuestOutputRefreshContext&>(context);
++        if (state_ && REXCVAR_GET(metal_debug_present_last_rt) && state_->targets.has_debug_target()) {
++          // CP and presenter command buffers use the same provider queue. Submit
++          // the guest first, then wait for this copy before mailbox publication.
++          if (!state_->targets.DebugPresent(metal.command_buffer(), metal.texture()) ||
++              !metal.SubmitAndWait()) return false;
++          if (!state_->debug_present_logged) {
++            REXLOG_WARN("Metal: metal_debug_present_last_rt is displaying guest rendering (textures/resolves incomplete)");
++            state_->debug_present_logged = true;
++          }
++          return true;
++        }
 +        return metal.Clear(0.10 + 0.06 * std::sin(phase),
 +                           0.14 + 0.06 * std::sin(phase + 2.0),
 +                           0.22 + 0.06 * std::sin(phase + 4.0));
 +      });
++  if (state_) state_->targets.BeginFrame();
 +  if (!refreshed && !swap_failure_logged_) {
 +    REXLOG_ERROR("Metal guest-output refresh failed");
 +    swap_failure_logged_ = true;
@@ -1144,10 +1223,10 @@ index 0000000..1a15ca3
 +#endif
 diff --git a/src/graphics/metal/msl_shader.cpp b/src/graphics/metal/msl_shader.cpp
 new file mode 100644
-index 0000000..c8f708d
+index 0000000..f59cc86
 --- /dev/null
 +++ b/src/graphics/metal/msl_shader.cpp
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,81 @@
 +#include <rex/graphics/metal/msl_shader.h>
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +#include <spirv_msl.hpp>
@@ -1169,7 +1248,7 @@ index 0000000..c8f708d
 +}
 +bool CompileMSL(MTL::Device* device, const std::vector<uint8_t>& binary,
 +                bool vertex, uint32_t texture_count, uint32_t sampler_count,
-+                MetalFunction& result) {
++                MetalFunction& result, uint32_t attachment_mask) {
 +  auto pool = Adopt(NS::AutoreleasePool::alloc()->init());
 +  try {
 +    if (binary.empty() || binary.size() % 4 || texture_count > 128 || sampler_count > 16)
@@ -1181,6 +1260,9 @@ index 0000000..c8f708d
 +    options.platform = cross::CompilerMSL::Options::macOS;
 +    options.set_msl_version(2, 4);
 +    options.argument_buffers = false;
++    // Match the real pass, including sparse MRT slots; preserve shader side effects.
++    options.enable_frag_output_mask = attachment_mask >> 1;
++    options.enable_frag_depth_builtin = (attachment_mask & 1) != 0;
 +    compiler.set_msl_options(options);
 +    auto stage = vertex ? spv::ExecutionModelVertex : spv::ExecutionModelFragment;
 +    compiler.set_entry_point("main", stage);
@@ -1202,10 +1284,6 @@ index 0000000..c8f708d
 +    for (uint32_t i = 0; i < texture_count; ++i) bind(texture_set, i, 0, i, 0);
 +    for (uint32_t i = 0; i < sampler_count; ++i)
 +      bind(texture_set, texture_count + i, 0, 0, i);
-+    // M2a has only scratch color attachment 0. Preserve all shader side effects.
-+    if (!vertex) {
-+      for (uint32_t i = 1; i < 4; ++i) compiler.mask_stage_output_by_location(i, 0);
-+    }
 +    std::string source = compiler.compile();
 +    std::string entry = compiler.get_cleansed_entry_point_name("main", stage);
 +    auto compile_options = Adopt(MTL::CompileOptions::alloc()->init());
@@ -1232,10 +1310,10 @@ index 0000000..c8f708d
 +#endif
 diff --git a/src/graphics/metal/pipeline_cache.cpp b/src/graphics/metal/pipeline_cache.cpp
 new file mode 100644
-index 0000000..05d805c
+index 0000000..12b86d5
 --- /dev/null
 +++ b/src/graphics/metal/pipeline_cache.cpp
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,249 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2021-2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
@@ -1309,15 +1387,16 @@ index 0000000..05d805c
 +  return table[uint32_t(op) & 7];
 +}
 +}  // namespace
-+MetalPipelineCache::MetalPipelineCache(MTL::Device* device)
-+    : device_(device), translator_(Features(device),
++MetalPipelineCache::MetalPipelineCache(MTL::Device* device, const MetalRenderTargetCache& targets)
++    : device_(device), targets_(targets), translator_(Features(device),
 +          REXCVAR_GET(native_2x_msaa) && device->supportsTextureSampleCount(2),
 +          REXCVAR_GET(native_2x_msaa) && device->supportsTextureSampleCount(2), false, 1, 1) {}
 +MetalPipelineCache::~MetalPipelineCache() {
 +  for (auto& [key, state] : pipelines_) if (state) state->release();
 +  for (auto& [key, state] : depths_) if (state) state->release();
 +}
-+MetalFunction* MetalPipelineCache::GetShader(SpirvShader& shader, uint64_t modification) {
++MetalFunction* MetalPipelineCache::GetShader(SpirvShader& shader, uint64_t modification,
++                                            uint32_t attachments) {
 +  auto* translation = shader.GetOrCreateTranslation(modification);
 +  if (!translation->is_translated() && !translator_.TranslateAnalyzedShader(*translation)) {
 +    PERF_METAL_counter_add(kMetalMslCompileFailures, 1);
@@ -1328,7 +1407,7 @@ index 0000000..05d805c
 +  if (!translation->is_valid()) return nullptr;
 +  const auto& binary = translation->translated_binary();
 +  uint64_t hash = XXH3_64bits(binary.data(), binary.size());
-+  std::array<uint64_t, 3> key{hash, modification, uint64_t(shader.type())};
++  std::array<uint64_t, 4> key{hash, modification, uint64_t(shader.type()), attachments};
 +  auto it = shaders_.find(key);
 +  if (it != shaders_.end()) return it->second->function ? it->second.get() : nullptr;
 +  auto value = std::make_unique<MetalFunction>();
@@ -1336,10 +1415,24 @@ index 0000000..05d805c
 +  value->modification = modification;
 +  bool success = CompileMSL(device_, binary, shader.type() == xenos::ShaderType::kVertex,
 +                            uint32_t(shader.GetTextureBindingsAfterTranslation().size()),
-+                            uint32_t(shader.GetSamplerBindingsAfterTranslation().size()), *value);
++                            uint32_t(shader.GetSamplerBindingsAfterTranslation().size()), *value, attachments);
 +  auto* result = value.get();
 +  shaders_.emplace(key, std::move(value));  // Cache failures; no endless recompilation.
 +  return success ? result : nullptr;
++}
++MetalFunction* MetalPipelineCache::GetDepthOnlyShader() {
++  using Mode = T::Modification::DepthStencilMode;
++  bool round = targets_.depth_float24_round();
++  auto& shader = depth_only_[round];
++  if (!shader) {
++    auto mode = round ? Mode::kFloat24Rounding : Mode::kFloat24Truncating;
++    auto binary = translator_.CreateDepthOnlyFragmentShader(mode);
++    shader = std::make_unique<MetalFunction>();
++    shader->hash = XXH3_64bits(binary.data(), binary.size());
++    shader->modification = uint64_t(mode);
++    CompileMSL(device_, binary, false, 0, 0, *shader);
++  }
++  return shader->function ? shader.get() : nullptr;
 +}
 +uint64_t MetalPipelineCache::VertexModification(const RegisterFile& regs, const SpirvShader& shader,
 +    Shader::HostVertexShaderType type, uint32_t interpolators, bool param_gen) const {
@@ -1355,7 +1448,7 @@ index 0000000..05d805c
 +  return m.value;
 +}
 +uint64_t MetalPipelineCache::PixelModification(const RegisterFile& regs, const SpirvShader& shader,
-+    uint32_t interpolators, uint32_t param_gen) const {
++    uint32_t interpolators, uint32_t param_gen, reg::RB_DEPTHCONTROL depth) const {
 +  T::Modification m(translator_.GetDefaultPixelShaderModification(
 +      shader.GetDynamicAddressableRegisterCount(regs.Get<reg::SQ_PROGRAM_CNTL>().ps_num_reg)));
 +  m.pixel.interpolator_mask = interpolators;
@@ -1368,7 +1461,12 @@ index 0000000..05d805c
 +    m.pixel.param_gen_point =
 +        regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type == xenos::PrimitiveType::kPointList;
 +  }
-+  if (shader.implicit_early_z_write_allowed() &&
++  if (targets_.depth_float24_convert() && depth.z_enable &&
++      regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
++    m.pixel.depth_stencil_mode = targets_.depth_float24_round()
++        ? T::Modification::DepthStencilMode::kFloat24Rounding
++        : T::Modification::DepthStencilMode::kFloat24Truncating;
++  } else if (shader.implicit_early_z_write_allowed() &&
 +      (!shader.writes_color_target(0) ||
 +       !draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>())))
 +    m.pixel.depth_stencil_mode = T::Modification::DepthStencilMode::kEarlyHint;
@@ -1376,12 +1474,18 @@ index 0000000..05d805c
 +}
 +MTL::RenderPipelineState* MetalPipelineCache::GetPipeline(const RegisterFile& regs,
 +    const MetalFunction& vs, const MetalFunction* ps, xenos::PrimitiveType primitive,
-+    uint32_t color_mask, bool rasterize, MTL::PixelFormat color, MTL::PixelFormat depth,
-+    uint32_t samples) {
-+  auto blend = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[0]);
-+  std::array<uint64_t, 12> key{vs.hash, vs.modification, ps ? ps->hash : 0,
-+      ps ? ps->modification : 0, uint64_t(primitive), uint64_t(color), uint64_t(depth),
-+      samples, uint64_t(blend.value & 0x1FFF1FFF), color_mask & 15, rasterize, bool(ps)};
++    uint32_t color_mask, bool rasterize) {
++  const auto& colors = targets_.color_formats();
++  auto depth = targets_.depth_format();
++  uint32_t samples = targets_.samples();
++  std::array<uint64_t, 18> key{vs.hash, vs.modification, ps ? ps->hash : 0,
++      ps ? ps->modification : 0, uint64_t(primitive), uint64_t(depth), samples,
++      color_mask, rasterize, bool(ps)};
++  for (uint32_t i = 0; i < 4; ++i) {
++    key[10 + i] = uint64_t(colors[i]);
++    key[14 + i] = colors[i] == MTL::PixelFormatInvalid ? 0 :
++        regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]).value & 0x1FFF1FFF;
++  }
 +  auto it = pipelines_.find(key);
 +  if (it != pipelines_.end()) {
 +    PERF_METAL_counter_add(kPipelineCacheHits, 1);
@@ -1399,21 +1503,25 @@ index 0000000..05d805c
 +          ? MTL::PrimitiveTopologyClassLine : MTL::PrimitiveTopologyClassTriangle);
 +  desc->setDepthAttachmentPixelFormat(depth);
 +  desc->setStencilAttachmentPixelFormat(depth);
-+  auto* attachment = desc->colorAttachments()->object(0);
-+  attachment->setPixelFormat(color);
-+  uint32_t mask = color_mask & 15;
-+  attachment->setWriteMask(MTL::ColorWriteMask(
-+      ((mask & 1) ? MTL::ColorWriteMaskRed : 0) |
-+      ((mask & 2) ? MTL::ColorWriteMaskGreen : 0) |
-+      ((mask & 4) ? MTL::ColorWriteMaskBlue : 0) |
-+      ((mask & 8) ? MTL::ColorWriteMaskAlpha : 0)));
-+  attachment->setBlendingEnabled(mask && (blend.value & 0x1FFF1FFF) != 0x00010001);
-+  attachment->setSourceRGBBlendFactor(BlendFactor(uint32_t(blend.color_srcblend)));
-+  attachment->setDestinationRGBBlendFactor(BlendFactor(uint32_t(blend.color_destblend)));
-+  attachment->setSourceAlphaBlendFactor(BlendFactor(uint32_t(blend.alpha_srcblend)));
-+  attachment->setDestinationAlphaBlendFactor(BlendFactor(uint32_t(blend.alpha_destblend)));
-+  attachment->setRgbBlendOperation(BlendOperation(uint32_t(blend.color_comb_fcn)));
-+  attachment->setAlphaBlendOperation(BlendOperation(uint32_t(blend.alpha_comb_fcn)));
++  for (uint32_t i = 0; i < 4; ++i) {
++    if (colors[i] == MTL::PixelFormatInvalid) continue;
++    auto blend = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
++    auto* attachment = desc->colorAttachments()->object(i);
++    attachment->setPixelFormat(colors[i]);
++    uint32_t mask = (color_mask >> (4 * i)) & 15;
++    attachment->setWriteMask(MTL::ColorWriteMask(
++        ((mask & 1) ? MTL::ColorWriteMaskRed : 0) |
++        ((mask & 2) ? MTL::ColorWriteMaskGreen : 0) |
++        ((mask & 4) ? MTL::ColorWriteMaskBlue : 0) |
++        ((mask & 8) ? MTL::ColorWriteMaskAlpha : 0)));
++    attachment->setBlendingEnabled(mask && (blend.value & 0x1FFF1FFF) != 0x00010001);
++    attachment->setSourceRGBBlendFactor(BlendFactor(uint32_t(blend.color_srcblend)));
++    attachment->setDestinationRGBBlendFactor(BlendFactor(uint32_t(blend.color_destblend)));
++    attachment->setSourceAlphaBlendFactor(BlendFactor(uint32_t(blend.alpha_srcblend)));
++    attachment->setDestinationAlphaBlendFactor(BlendFactor(uint32_t(blend.alpha_destblend)));
++    attachment->setRgbBlendOperation(BlendOperation(uint32_t(blend.color_comb_fcn)));
++    attachment->setAlphaBlendOperation(BlendOperation(uint32_t(blend.alpha_comb_fcn)));
++  }
 +  NS::Error* error = nullptr;
 +  auto* pipeline = device_->newRenderPipelineState(desc.get(), &error);
 +  if (!pipeline) REXLOG_ERROR("Metal pipeline creation failed: {}", ErrorText(error));
@@ -1455,12 +1563,572 @@ index 0000000..05d805c
 +}
 +}  // namespace rex::graphics::metal
 +#endif
+diff --git a/src/graphics/metal/render_target_cache.cpp b/src/graphics/metal/render_target_cache.cpp
+new file mode 100644
+index 0000000..6049163
+--- /dev/null
++++ b/src/graphics/metal/render_target_cache.cpp
+@@ -0,0 +1,369 @@
++// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
++// Copyright 2022 Ben Vanik. All rights reserved.
++// Released under the BSD license - see LICENSE in the root for more details.
++#include <rex/graphics/metal/render_target_cache.h>
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++#include <algorithm>
++#include <memory>
++#include <rex/graphics/flags.h>
++#include <rex/logging.h>
++#include "../../ui/metal/metal_util.h"
++#include "render_target_shaders.h"
++
++namespace rex::graphics::metal {
++using ui::metal::Adopt;
++using ui::metal::ErrorText;
++using ui::metal::ReleaseObject;
++namespace {
++void Attachment(MTL::RenderPassAttachmentDescriptor* a, MTL::Texture* texture, bool fresh) {
++  a->setTexture(texture);
++  a->setLoadAction(fresh ? MTL::LoadActionClear : MTL::LoadActionLoad);
++  a->setStoreAction(MTL::StoreActionStore);
++}
++}
++MetalRenderTargetCache::MetalRenderTargetCache(const RegisterFile& regs,
++    const memory::Memory& memory, MTL::Device* device, MetalSubmission& submission)
++    : RenderTargetCache(regs, memory, 1, 1), device_(device), submission_(submission),
++      gamma_unorm16_(REXCVAR_GET(gamma_render_target_as_unorm16)),
++      depth_float24_convert_(REXCVAR_GET(depth_float24_convert_in_pixel_shader)),
++      depth_float24_round_(REXCVAR_GET(depth_float24_round)),
++      native_2x_(REXCVAR_GET(native_2x_msaa) && device->supportsTextureSampleCount(2)) {
++  InitializeCommon();
++}
++MetalRenderTargetCache::~MetalRenderTargetCache() {
++  ShutdownCommon();
++  for (auto& [key, pipeline] : transfer_pipelines_) ReleaseObject(pipeline);
++  ReleaseObject(transfer_depth_state_);
++}
++MetalRenderTargetCache::Target::~Target() {
++  ReleaseObject(stencil);
++  ReleaseObject(transfer);
++  ReleaseObject(texture);
++}
++void MetalRenderTargetCache::ClearCache() {
++  submission_.EndEncoding();
++  bound_.fill(nullptr);
++  colors_.fill(MTL::PixelFormatInvalid);
++  BeginFrame();
++  RenderTargetCache::ClearCache();
++}
++void MetalRenderTargetCache::BeginFrame() {
++  RenderTargetCache::BeginFrame();
++  debug_target_ = nullptr;
++  debug_width_ = debug_height_ = 0;
++}
++bool MetalRenderTargetCache::IsHostDepthEncodingDifferent(xenos::DepthRenderTargetFormat f) const {
++  return f == xenos::DepthRenderTargetFormat::kD24S8 ||
++      (f == xenos::DepthRenderTargetFormat::kD24FS8 && !depth_float24_convert_);
++}
++uint32_t MetalRenderTargetCache::Samples(xenos::MsaaSamples s) const {
++  return s == xenos::MsaaSamples::k2X && !native_2x_ ? 4 : 1u << uint32_t(s);
++}
++MTL::PixelFormat MetalRenderTargetCache::ColorFormat(xenos::ColorRenderTargetFormat f) const {
++  // Match this SDK's Vulkan formats through its pinned MVKPixelFormats.mm.
++  // Apple GPU RG16/RGBA16 SNORM and RGBA16 UNORM have color-attachment support.
++  using F = xenos::ColorRenderTargetFormat;
++  switch (f) {
++    case F::k_8_8_8_8: return MTL::PixelFormatRGBA8Unorm;
++    case F::k_8_8_8_8_GAMMA:
++      return gamma_unorm16_ ? MTL::PixelFormatRGBA16Unorm : MTL::PixelFormatRGBA8Unorm;
++    case F::k_2_10_10_10:
++    case F::k_2_10_10_10_AS_10_10_10_10: return MTL::PixelFormatRGBA8Unorm;
++    case F::k_2_10_10_10_FLOAT:
++    case F::k_2_10_10_10_FLOAT_AS_16_16_16_16: return MTL::PixelFormatRGBA16Float;
++    case F::k_16_16: return MTL::PixelFormatRG16Snorm;
++    case F::k_16_16_16_16: return MTL::PixelFormatRGBA16Snorm;
++    case F::k_16_16_FLOAT: return MTL::PixelFormatRG16Float;
++    case F::k_16_16_16_16_FLOAT: return MTL::PixelFormatRGBA16Float;
++    case F::k_32_FLOAT: return MTL::PixelFormatR32Float;
++    case F::k_32_32_FLOAT: return MTL::PixelFormatRG32Float;
++    default: return MTL::PixelFormatInvalid;
++  }
++}
++MTL::PixelFormat MetalRenderTargetCache::TransferFormat(xenos::ColorRenderTargetFormat f) {
++  using F = xenos::ColorRenderTargetFormat;
++  switch (f) {
++    case F::k_16_16: case F::k_16_16_FLOAT: return MTL::PixelFormatRG16Uint;
++    case F::k_16_16_16_16: case F::k_16_16_16_16_FLOAT: return MTL::PixelFormatRGBA16Uint;
++    case F::k_32_FLOAT: return MTL::PixelFormatR32Uint;
++    case F::k_32_32_FLOAT: return MTL::PixelFormatRG32Uint;
++    default: return MTL::PixelFormatInvalid;  // Use the resource's float/unorm view.
++  }
++}
++RenderTargetCache::RenderTarget* MetalRenderTargetCache::CreateRenderTarget(RenderTargetKey key) {
++  uint32_t samples = Samples(key.msaa_samples);
++  if (!device_->supportsTextureSampleCount(samples)) return nullptr;
++  auto desc = Adopt(MTL::TextureDescriptor::alloc()->init());
++  desc->setTextureType(samples > 1 ? MTL::TextureType2DMultisample : MTL::TextureType2D);
++  desc->setPixelFormat(key.is_depth ? MTL::PixelFormatDepth32Float_Stencil8
++                                  : ColorFormat(key.GetColorFormat()));
++  if (desc->pixelFormat() == MTL::PixelFormatInvalid) return nullptr;
++  desc->setWidth(key.GetWidth());
++  desc->setHeight(GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples));
++  desc->setSampleCount(samples);
++  desc->setStorageMode(MTL::StorageModePrivate);
++  desc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead |
++                 MTL::TextureUsagePixelFormatView);
++  auto rt = std::make_unique<Target>(key);
++  rt->texture = device_->newTexture(desc.get());
++  if (!rt->texture) {
++    REXLOG_ERROR("Metal render target allocation failed: {}", key.GetDebugName());
++    return nullptr;
++  }
++  if (key.is_depth) {
++    rt->stencil = rt->texture->newTextureView(MTL::PixelFormatX32_Stencil8);
++    if (!rt->stencil) return nullptr;
++  } else {
++    auto format = TransferFormat(key.GetColorFormat());
++    if (format == MTL::PixelFormatInvalid) {
++      rt->transfer = rt->texture;
++      rt->transfer->retain();
++    } else {
++      rt->transfer = rt->texture->newTextureView(format);
++      if (!rt->transfer) return nullptr;
++    }
++  }
++  PERF_METAL_counter_add(kMetalRenderTargetsCreated, 1);
++  return rt.release();
++}
++MTL::PixelFormat MetalRenderTargetCache::depth_format() const {
++  return bound_[0] ? bound_[0]->texture->pixelFormat() : MTL::PixelFormatInvalid;
++}
++bool MetalRenderTargetCache::Update(bool rasterize, reg::RB_DEPTHCONTROL depth,
++                                    uint32_t color_mask, const Shader& vs) {
++  if (!RenderTargetCache::Update(rasterize, depth, color_mask, vs) || !submission_.Begin())
++    return false;
++  std::array<Target*, 5> targets{};
++  bool transfers = false;
++  for (uint32_t i = 0; i < targets.size(); ++i) {
++    targets[i] = static_cast<Target*>(last_update_accumulated_render_targets()[i]);
++    transfers |= !last_update_transfers()[i].empty();
++  }
++  auto surface = register_file().Get<reg::RB_SURFACE_INFO>();
++  uint32_t pitch = ((surface.surface_pitch << uint32_t(surface.msaa_samples >= xenos::MsaaSamples::k4X))
++                     + 79) / 80;
++  uint32_t width = std::max(1u, RenderTargetKey::GetWidth(pitch, surface.msaa_samples));
++  uint32_t height = std::max(1u, GetRenderTargetHeight(pitch, surface.msaa_samples));
++  uint32_t samples = Samples(surface.msaa_samples);
++  if (transfers) submission_.EndEncoding(perf::CounterId::kPassEndTransfer);
++  else if (bound_ != targets || width_ != width || height_ != height || samples_ != samples)
++    submission_.EndEncoding(perf::CounterId::kPassEndRtChange);
++  for (uint32_t i = 0; i < targets.size(); ++i) {
++    for (const auto& transfer : last_update_transfers()[i]) {
++      if (!targets[i] || !TransferTo(*targets[i], transfer)) {
++        PERF_METAL_counter_add(kMetalRtTransfersSkipped, 1);
++        if (!transfer_warning_logged_) {
++          REXLOG_WARN("Metal: unsupported/failed EDRAM transfers counted in metal_rt_transfers_skipped");
++          transfer_warning_logged_ = true;
++        }
++      }
++    }
++  }
++  bound_ = targets;
++  width_ = width; height_ = height; samples_ = samples;
++  for (uint32_t i = 0; i < colors_.size(); ++i)
++    colors_[i] = bound_[i + 1] ? bound_[i + 1]->texture->pixelFormat() : MTL::PixelFormatInvalid;
++  return BeginPass();
++}
++bool MetalRenderTargetCache::BeginPass() {
++  if (submission_.encoder) return true;
++  auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
++  pass->setRenderTargetWidth(width_);
++  pass->setRenderTargetHeight(height_);
++  pass->setDefaultRasterSampleCount(samples_);
++  for (uint32_t i = 0; i < bound_.size(); ++i) {
++    auto* rt = bound_[i];
++    if (!rt) continue;
++    if (!i) {
++      Attachment(pass->depthAttachment(), rt->texture, !rt->initialized);
++      pass->depthAttachment()->setClearDepth(1);
++      Attachment(pass->stencilAttachment(), rt->texture, !rt->initialized);
++      pass->stencilAttachment()->setClearStencil(0);
++    } else {
++      Attachment(pass->colorAttachments()->object(i - 1), rt->texture, !rt->initialized);
++      pass->colorAttachments()->object(i - 1)->setClearColor(MTL::ClearColor(0, 0, 0, 0));
++    }
++  }
++  auto* encoder = submission_.buffer()->renderCommandEncoder(pass);
++  if (!encoder) return false;
++  submission_.encoder = encoder;
++  encoder->retain();
++  for (auto* rt : bound_) if (rt) rt->initialized = true;
++  PERF_METAL_counter_add(kRenderPassesBegun, 1);
++  return true;
++}
++MTL::RenderPipelineState* MetalRenderTargetCache::TransferPipeline(
++    const Target& source, const Target& dest, bool host_depth, bool preview) {
++  auto sk = source.key(), dk = dest.key();
++  bool depth = dk.is_depth && !preview;
++  bool source_uint = !sk.is_depth && TransferFormat(sk.GetColorFormat()) != MTL::PixelFormatInvalid;
++  bool dest_uint = !dk.is_depth && TransferFormat(dk.GetColorFormat()) != MTL::PixelFormatInvalid;
++  auto format = preview ? MTL::PixelFormatBGRA8Unorm :
++      depth ? MTL::PixelFormatDepth32Float_Stencil8 : dest.transfer->pixelFormat();
++  uint32_t samples = uint32_t(source.texture->sampleCount());
++  std::array<uint32_t, 6> key{sk.resource_format, dk.resource_format, samples,
++      uint32_t(depth) | (uint32_t(host_depth) << 1) | (uint32_t(preview) << 2),
++      uint32_t(format), uint32_t(sk.msaa_samples)};
++  auto [it, inserted] = transfer_pipelines_.emplace(key, nullptr);
++  if (!inserted) return it->second;
++  std::string code = fmt::format(
++      "#define SRC_FORMAT {}\n#define DST_FORMAT {}\n#define MSAA {}\n"
++      "#define DEPTH {}\n#define SOURCE_UINT {}\n#define DEST_UINT {}\n"
++      "#define HOST_DEPTH {}\n#define PREVIEW {}\n#define GAMMA_16 {}\n"
++      "#define ROUND_DEPTH {}\n#define TWO_IN_FOUR {}\n",
++      uint32_t(sk.resource_format), uint32_t(dk.resource_format), uint32_t(samples > 1),
++      uint32_t(depth), uint32_t(source_uint), uint32_t(dest_uint), uint32_t(host_depth),
++      uint32_t(preview), uint32_t(gamma_unorm16_), uint32_t(depth_float24_round_),
++      uint32_t(sk.msaa_samples == xenos::MsaaSamples::k2X && samples == 4));
++  code += kRenderTargetMSL;
++  auto options = Adopt(MTL::CompileOptions::alloc()->init());
++  options->setLanguageVersion(MTL::LanguageVersion2_4);
++  options->setFastMathEnabled(false);
++  NS::Error* error = nullptr;
++  auto library = Adopt(device_->newLibrary(NS::String::string(code.c_str(), NS::UTF8StringEncoding),
++                                           options.get(), &error));
++  if (!library) {
++    PERF_METAL_counter_add(kMetalMslCompileFailures, 1);
++    REXLOG_ERROR("Metal RT shader compilation failed: {}", ErrorText(error));
++    return nullptr;
++  }
++  auto vertex = Adopt(library->newFunction(NS::String::string("rt_vertex", NS::UTF8StringEncoding)));
++  auto fragment = Adopt(library->newFunction(NS::String::string("rt_fragment", NS::UTF8StringEncoding)));
++  auto desc = Adopt(MTL::RenderPipelineDescriptor::alloc()->init());
++  desc->setVertexFunction(vertex.get());
++  desc->setFragmentFunction(fragment.get());
++  desc->setRasterSampleCount(preview ? 1 : samples);
++  if (depth) {
++    desc->setDepthAttachmentPixelFormat(format);
++    desc->setStencilAttachmentPixelFormat(format);
++  } else {
++    desc->colorAttachments()->object(0)->setPixelFormat(format);
++  }
++  it->second = device_->newRenderPipelineState(desc.get(), &error);
++  if (!it->second) REXLOG_ERROR("Metal RT pipeline creation failed: {}", ErrorText(error));
++  else PERF_METAL_counter_add(kMetalPipelinesCreated, 1);
++  return it->second;
++}
++bool MetalRenderTargetCache::TransferTo(Target& dest, const Transfer& transfer) {
++  auto* source = static_cast<Target*>(transfer.source);
++  auto* host = static_cast<Target*>(transfer.host_depth_source);
++  if (!source || !source->initialized) return false;
++  auto dk = dest.key(), sk = source->key();
++  // 32<->64bpp, color<->depth and sample-layout conversions remain counted stubs.
++  if (dk.is_depth != sk.is_depth || dk.Is64bpp() != sk.Is64bpp() ||
++      dk.msaa_samples != sk.msaa_samples) return false;
++  if (host && (!dk.is_depth || !host->initialized || !host->key().is_depth ||
++      host->key().GetDepthFormat() != dk.GetDepthFormat() ||
++      host->key().msaa_samples != dk.msaa_samples)) return false;
++  uint32_t tw = 80u >> (uint32_t(dk.Is64bpp()) + uint32_t(dk.msaa_samples >= xenos::MsaaSamples::k4X));
++  uint32_t th = 16u >> uint32_t(dk.msaa_samples >= xenos::MsaaSamples::k2X);
++  // Validate every tile before encoding any writes. Pitch/base changes and EDRAM
++  // wrapping use the same 11-bit addressing in the shader as the common cache.
++  for (uint32_t tile = transfer.start_tiles; tile < transfer.end_tiles; ++tile) {
++    for (auto* rt : {&dest, source, host}) {
++      if (!rt) continue;
++      auto key = rt->key();
++      uint32_t local = (tile - key.base_tiles) & (xenos::kEdramTileCount - 1);
++      uint32_t pitch = key.GetPitchTiles();
++      if ((local % pitch + 1) * tw > rt->texture->width() ||
++          (local / pitch + 1) * th > rt->texture->height()) return false;
++    }
++  }
++  // The prior host-depth owner may be the destination. Snapshot just the
++  // transferred tiles first; never sample an attachment being written.
++  std::unique_ptr<Target> snapshot;
++  if (host == &dest) {
++    snapshot.reset(static_cast<Target*>(CreateRenderTarget(dk)));
++    if (!snapshot || !TransferTo(*snapshot, Transfer(transfer.start_tiles,
++        transfer.end_tiles, &dest, nullptr))) return false;
++    host = snapshot.get();
++  }
++  auto* pipeline = TransferPipeline(*source, dest, host != nullptr, false);
++  if (!pipeline) return false;
++  if (dk.is_depth && !transfer_depth_state_) {
++    auto desc = Adopt(MTL::DepthStencilDescriptor::alloc()->init());
++    desc->setDepthCompareFunction(MTL::CompareFunctionAlways);
++    desc->setDepthWriteEnabled(true);
++    auto stencil = Adopt(MTL::StencilDescriptor::alloc()->init());
++    stencil->setStencilCompareFunction(MTL::CompareFunctionAlways);
++    stencil->setDepthStencilPassOperation(MTL::StencilOperationReplace);
++    stencil->setReadMask(255); stencil->setWriteMask(255);
++    desc->setFrontFaceStencil(stencil.get()); desc->setBackFaceStencil(stencil.get());
++    transfer_depth_state_ = device_->newDepthStencilState(desc.get());
++    if (!transfer_depth_state_) return false;
++  }
++  auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
++  if (dk.is_depth) {
++    Attachment(pass->depthAttachment(), dest.texture, !dest.initialized);
++    pass->depthAttachment()->setClearDepth(1);
++    Attachment(pass->stencilAttachment(), dest.texture, !dest.initialized);
++    pass->stencilAttachment()->setClearStencil(0);
++  } else {
++    Attachment(pass->colorAttachments()->object(0), dest.transfer, !dest.initialized);
++    pass->colorAttachments()->object(0)->setClearColor(MTL::ClearColor(0, 0, 0, 0));
++  }
++  auto* encoder = submission_.buffer()->renderCommandEncoder(pass);
++  if (!encoder) return false;
++  PERF_METAL_counter_add(kRenderPassesBegun, 1);
++  encoder->setRenderPipelineState(pipeline);
++  if (dk.is_depth) encoder->setDepthStencilState(transfer_depth_state_);
++  encoder->setFragmentTexture(dk.is_depth ? source->texture : source->transfer, 0);
++  if (dk.is_depth) encoder->setFragmentTexture(source->stencil, 1);
++  if (host) encoder->setFragmentTexture(host->texture, 2);
++  std::array<uint32_t, 12> constants{sk.base_tiles, dk.base_tiles, sk.GetPitchTiles(),
++      dk.GetPitchTiles(), tw, th, host ? uint32_t(host->key().base_tiles) : 0u,
++      host ? host->key().GetPitchTiles() : 0};
++  encoder->setFragmentBytes(constants.data(), sizeof(constants), 0);
++  encoder->setViewport(MTL::Viewport{0, 0, double(dest.texture->width()),
++                                      double(dest.texture->height()), 0, 1});
++  Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithoutCutout];
++  uint32_t count = transfer.GetRectangles(dk.base_tiles, dk.GetPitchTiles(), dk.msaa_samples,
++                                          dk.Is64bpp(), rectangles);
++  for (uint32_t i = 0; i < count; ++i) {
++    auto r = rectangles[i];
++    encoder->setScissorRect(MTL::ScissorRect{r.x_pixels, r.y_pixels, r.width_pixels, r.height_pixels});
++    encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
++  }
++  encoder->endEncoding();
++  PERF_METAL_counter_add(kPassEndTransfer, 1);
++  dest.initialized = true;
++  return true;
++}
++void MetalRenderTargetCache::MarkDraw(uint32_t mask, uint32_t width, uint32_t height) {
++  uint32_t used = GetLastUpdateBoundRenderTargets();
++  for (uint32_t i = 0; i < 4; ++i) {
++    if (!(used & (2u << i)) || !(mask & (15u << (4 * i)))) continue;
++    auto* rt = bound_[i + 1];
++    uint32_t w = std::min(width, uint32_t(rt->texture->width()));
++    uint32_t h = std::min(height, uint32_t(rt->texture->height()));
++    if (w && h && uint64_t(w) * h >= uint64_t(debug_width_) * debug_height_) {
++      debug_target_ = rt; debug_width_ = w; debug_height_ = h;
++    }
++  }
++}
++bool MetalRenderTargetCache::DebugPresent(MTL::CommandBuffer* buffer, MTL::Texture* output) {
++  if (!debug_target_ || !buffer || !output) return false;
++  auto* pipeline = TransferPipeline(*debug_target_, *debug_target_, false, true);
++  if (!pipeline) return false;
++  auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
++  auto* color = pass->colorAttachments()->object(0);
++  color->setTexture(output);
++  color->setLoadAction(MTL::LoadActionDontCare);
++  color->setStoreAction(MTL::StoreActionStore);
++  auto* encoder = buffer->renderCommandEncoder(pass);
++  if (!encoder) return false;
++  PERF_METAL_counter_add(kRenderPassesBegun, 1);
++  encoder->setRenderPipelineState(pipeline);
++  encoder->setFragmentTexture(debug_target_->texture, 0);
++  std::array<uint32_t, 12> constants{};
++  constants[8] = debug_width_; constants[9] = debug_height_;
++  constants[10] = uint32_t(output->width()); constants[11] = uint32_t(output->height());
++  encoder->setFragmentBytes(constants.data(), sizeof(constants), 0);
++  encoder->setViewport(MTL::Viewport{0, 0, double(output->width()), double(output->height()), 0, 1});
++  encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
++  encoder->endEncoding();
++  PERF_METAL_counter_add(kPassEndSwap, 1);
++  return true;
++}
++}  // namespace rex::graphics::metal
++#endif
+diff --git a/src/graphics/metal/render_target_shaders.h b/src/graphics/metal/render_target_shaders.h
+new file mode 100644
+index 0000000..224274c
+--- /dev/null
++++ b/src/graphics/metal/render_target_shaders.h
+@@ -0,0 +1,179 @@
++#pragma once
++// Host-RT conversion rules mirror vulkan/render_target_cache.cpp and
++// SpirvShaderTranslator's 7e3 / 20e4 helpers (Xenia, BSD; see LICENSE).
++namespace rex::graphics::metal {
++inline constexpr const char* kRenderTargetMSL = R"MSL(
++#include <metal_stdlib>
++using namespace metal;
++struct Params { uint4 address; uint4 shape; uint4 extent; };
++struct VertexOut { float4 position [[position]]; };
++vertex VertexOut rt_vertex(uint id [[vertex_id]]) {
++  return {float4(float2((id << 1) & 2, id & 2) * 2.0f - 1.0f, 0, 1)};
++}
++#if MSAA
++#define TEX(T) texture2d_ms<T>
++#define DEPTH_TEX depth2d_ms<float>
++#define READ(t, p, s) t.read(p, s)
++#else
++#define TEX(T) texture2d<T>
++#define DEPTH_TEX depth2d<float>
++#define READ(t, p, s) t.read(p)
++#endif
++float linear_to_gamma(float v) {
++  v = saturate(v) * 1023.0f;
++  return (v >= 512 ? v * 0.125f + 128 :
++          v >= 128 ? v * 0.25f + 64 :
++          v >= 64 ? v * 0.5f + 32 : v) / 255.0f;
++}
++float gamma_to_linear(float v) {
++  float t = saturate(v) * 255.0f;
++  float scale = t >= 192 ? 8 : t >= 96 ? 4 : t >= 64 ? 2 : 1;
++  float offset = t >= 192 ? -1024 : t >= 96 ? -256 : t >= 64 ? -64 : 0;
++  float l = t * scale + offset;
++  return (l + trunc(l * (scale / 1024.0f))) / 1023.0f;
++}
++uint to_7e3(float v) {
++  uint b = as_type<uint>(fmin(fmax(v, 0.0f), 31.875f));
++  b = b < 0x3E800000u ? ((b & 0x7FFFFFu) | 0x800000u) >>
++      min(125u - (b >> 23), 24u) : b - (124u << 23);
++  return ((b + 0x7FFFu + ((b >> 16) & 1)) >> 16) & 1023;
++}
++float from_7e3(uint v) {
++  uint e = (v >> 7) & 7, m = v & 127;
++  return e ? ldexp(float(128 + m), int(e) - 10) : ldexp(float(m), -9);
++}
++uint pack_depth(float v, uint format) {
++  if (!format) return uint(rint(saturate(v) * 16777215.0f));
++  // D24FS8 is stored in [0, 1) on the host for guest [0, 2).
++  if (!(v > 0)) return 0;
++  uint b = as_type<uint>(v);
++  if (b >= 0x3F7FFFF8u) return 0xFFFFFF;
++  b = b < 0x38000000u ? ((b & 0x7FFFFFu) | 0x800000u) >>
++      min(112u - (b >> 23), 24u) : b - (111u << 23);
++#if ROUND_DEPTH
++  b += 3 + ((b >> 3) & 1);
++#endif
++  return (b >> 3) & 0xFFFFFF;
++}
++float unpack_depth(uint v, uint format) {
++  if (!format) return float(v) / 16777215.0f;
++  uint e = v >> 20, m = v & 0xFFFFF;
++  return e ? as_type<float>(((e + 111) << 23) | (m << 3)) : ldexp(float(m), -35);
++}
++uint2 source_coord(uint2 p, constant Params& c, bool host = false) {
++  uint tile = c.address.y + (p.y / c.shape.y) * c.address.w + p.x / c.shape.x;
++  uint relative = (tile - (host ? c.shape.z : c.address.x)) & 2047;
++  uint pitch = host ? c.shape.w : c.address.z;
++  return uint2(relative % pitch, relative / pitch) * c.shape.xy + p % c.shape.xy;
++}
++#if PREVIEW
++fragment float4 rt_fragment(float4 p [[position]], TEX(float) src [[texture(0)]],
++                           constant Params& c [[buffer(0)]]) {
++  uint2 xy = min(uint2(p.xy * float2(c.extent.xy) / float2(c.extent.zw)),
++                 c.extent.xy - 1);
++  float4 color;
++#if MSAA
++  color = float4(0);
++#if TWO_IN_FOUR
++  color = (src.read(xy, 0) + src.read(xy, 3)) * 0.5f;
++#else
++  for (uint s = 0; s < src.get_num_samples(); ++s) color += src.read(xy, s);
++  color /= float(src.get_num_samples());
++#endif
++#else
++  color = src.read(xy);
++#endif
++#if SRC_FORMAT == 1 && GAMMA_16
++  color.rgb = float3(linear_to_gamma(color.r), linear_to_gamma(color.g),
++                     linear_to_gamma(color.b));
++#endif
++  return float4(color.rgb, 1);
++}
++#elif DEPTH
++struct DepthOut { float depth [[depth(any)]]; uint stencil [[stencil]]; };
++fragment DepthOut rt_fragment(float4 p [[position]], uint sample [[sample_id]],
++                              DEPTH_TEX src [[texture(0)]],
++                              TEX(uint) stencil [[texture(1)]],
++#if HOST_DEPTH
++                              DEPTH_TEX old_depth [[texture(2)]],
++#endif
++                              constant Params& c [[buffer(0)]]) {
++  uint2 xy = source_coord(uint2(p.xy), c);
++  float d = READ(src, xy, sample);
++  uint bits = pack_depth(d, SRC_FORMAT);
++#if SRC_FORMAT != DST_FORMAT
++  d = unpack_depth(bits, DST_FORMAT);
++#endif
++#if HOST_DEPTH
++  float old = READ(old_depth, source_coord(uint2(p.xy), c, true), sample);
++  if (pack_depth(old, DST_FORMAT) == bits) d = old;
++#endif
++  return {d, READ(stencil, xy, sample).r};
++}
++#else
++#if SOURCE_UINT
++#define SOURCE_TYPE uint
++#else
++#define SOURCE_TYPE float
++#endif
++#if DEST_UINT
++#define DEST_TYPE uint
++#else
++#define DEST_TYPE float
++#endif
++uint2 pack_color(vec<SOURCE_TYPE, 4> c) {
++#if SRC_FORMAT == 4 || SRC_FORMAT == 5 || SRC_FORMAT == 6 || SRC_FORMAT == 7
++  return uint2(c.x | (c.y << 16), c.z | (c.w << 16));
++#elif SRC_FORMAT == 14 || SRC_FORMAT == 15
++  return c.xy;
++#else
++#if SRC_FORMAT == 0 || SRC_FORMAT == 1
++#if SRC_FORMAT == 1 && GAMMA_16
++  c.rgb = float3(linear_to_gamma(c.r), linear_to_gamma(c.g), linear_to_gamma(c.b));
++#endif
++  uint4 v = uint4(saturate(c) * 255.0f + 0.5f);
++  return uint2(v.x | (v.y << 8) | (v.z << 16) | (v.w << 24), 0);
++#else
++#if SRC_FORMAT == 3 || SRC_FORMAT == 12
++  uint3 rgb = uint3(to_7e3(c.r), to_7e3(c.g), to_7e3(c.b));
++#else
++  uint3 rgb = uint3(saturate(c.rgb) * 1023.0f + 0.5f);
++#endif
++  return uint2(rgb.x | (rgb.y << 10) | (rgb.z << 20) |
++               (uint(saturate(c.a) * 3.0f + 0.5f) << 30), 0);
++#endif
++#endif
++}
++vec<DEST_TYPE, 4> unpack_color(uint2 v) {
++#if DST_FORMAT == 4 || DST_FORMAT == 5 || DST_FORMAT == 6 || DST_FORMAT == 7
++  return uint4(v.x & 65535, v.x >> 16, v.y & 65535, v.y >> 16);
++#elif DST_FORMAT == 14 || DST_FORMAT == 15
++  return uint4(v, 0, 0);
++#elif DST_FORMAT == 0 || DST_FORMAT == 1
++  float4 c = float4(uint4(v.x, v.x >> 8, v.x >> 16, v.x >> 24) & 255) / 255.0f;
++#if DST_FORMAT == 1 && GAMMA_16
++  c.rgb = float3(gamma_to_linear(c.r), gamma_to_linear(c.g), gamma_to_linear(c.b));
++#endif
++  return c;
++#else
++  uint3 rgb = uint3(v.x, v.x >> 10, v.x >> 20) & 1023;
++#if DST_FORMAT == 3 || DST_FORMAT == 12
++  return float4(from_7e3(rgb.x), from_7e3(rgb.y), from_7e3(rgb.z), float(v.x >> 30) / 3);
++#else
++  return float4(float3(rgb) / 1023.0f, float(v.x >> 30) / 3);
++#endif
++#endif
++}
++fragment vec<DEST_TYPE, 4> rt_fragment(float4 p [[position]], uint sample [[sample_id]],
++                                      TEX(SOURCE_TYPE) src [[texture(0)]],
++                                      constant Params& c [[buffer(0)]]) {
++  auto color = READ(src, source_coord(uint2(p.xy), c), sample);
++#if SRC_FORMAT == DST_FORMAT
++  return color;
++#else
++  return unpack_color(pack_color(color));
++#endif
++}
++#endif
++)MSL";
++}  // namespace rex::graphics::metal
 diff --git a/src/graphics/metal/resources.cpp b/src/graphics/metal/resources.cpp
 new file mode 100644
-index 0000000..7f58b5f
+index 0000000..82a28c6
 --- /dev/null
 +++ b/src/graphics/metal/resources.cpp
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,284 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2021-2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
@@ -1521,16 +2189,19 @@ index 0000000..7f58b5f
 +  }
 +  return true;
 +}
-+void MetalSubmission::EndEncoding() {
++void MetalSubmission::EndEncoding([[maybe_unused]] perf::CounterId reason) {
 +  if (encoder) {
 +    encoder->endEncoding();
 +    ReleaseObject(encoder);
++#if defined(REXGLUE_ENABLE_PERF_COUNTERS) && !REX_PLATFORM_PS5
++    perf::IncrementCounter(reason);
++#endif
 +  }
 +}
-+bool MetalSubmission::Submit() {
++bool MetalSubmission::Submit(perf::CounterId reason) {
 +  auto pool = Adopt(NS::AutoreleasePool::alloc()->init());
 +  if (!buffer_) return Poll();
-+  EndEncoding();
++  EndEncoding(reason);
 +  buffer_->encodeSignalEvent(event_, epoch_);
 +  pending_.push_back({epoch_++, buffer_, uniforms_});
 +  buffer_->commit();
@@ -1566,7 +2237,7 @@ index 0000000..7f58b5f
 +  if (!Poll()) return false;
 +  if (last_use == epoch_ && buffer_) {
 +    PERF_METAL_counter_add(kMetalSplitForUpload, 1);
-+    if (!Submit() || !Begin()) return false;
++    if (!Submit(perf::CounterId::kPassEndBarrierUpload) || !Begin()) return false;
 +  }
 +  if (last_use > event_->signaledValue()) {
 +    const auto start = std::chrono::steady_clock::now();
@@ -1582,7 +2253,8 @@ index 0000000..7f58b5f
 +  constexpr size_t kRingSize = 8 * 1024 * 1024;
 +  size = (size + 255) & ~size_t(255);
 +  if (size > kRingSize || !Begin()) return false;
-+  if (uniform_offset_ + size > kRingSize && (!Submit() || !Begin())) return false;
++  if (uniform_offset_ + size > kRingSize &&
++      (!Submit(perf::CounterId::kPassEndBarrierUpload) || !Begin())) return false;
 +  if (!uniforms_) {
 +    if (free_uniforms_.empty()) {
 +      uniforms_ = device_->newBuffer(kRingSize, MTL::ResourceStorageModeShared);
