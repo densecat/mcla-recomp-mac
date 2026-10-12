@@ -106,7 +106,10 @@ fi
 step "3/6 build and install the SDK (the long step, once)"
 if [ ! -x "$INSTALL/bin/rexglue" ] || [ "$MARKER" -nt "$INSTALL/bin/rexglue" ] || [ "$WITH_TESTS" -eq 1 ]; then
     cd "$SDK" || fail "cannot enter $SDK"
-    configure_args="-DREXGLUE_ENABLE_TRACY=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 -DCMAKE_C_COMPILER=$CC_BIN -DCMAKE_CXX_COMPILER=$CXX_BIN"
+    # Apple's install_name_tool, not whichever is first on PATH: Anaconda's
+    # cctools port writes a placeholder signature that does not verify.
+    install_name_tool_bin="$(xcrun -f install_name_tool)" || fail "xcrun cannot find install_name_tool"
+    configure_args="-DREXGLUE_ENABLE_TRACY=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 -DCMAKE_C_COMPILER=$CC_BIN -DCMAKE_CXX_COMPILER=$CXX_BIN -DCMAKE_INSTALL_NAME_TOOL=$install_name_tool_bin"
     if [ "$WITH_TESTS" -eq 1 ]; then configure_args="$configure_args -DREXGLUE_BUILD_TESTS=ON"; fi
     # shellcheck disable=SC2086 # configure_args is a list of -D options without spaces in values
     logged sdk-configure cmake --preset mac-arm64 $configure_args ${PPC_BINS:+"-DREXGLUE_PPC_PREBUILT_DIR=$PPC_BINS"}
@@ -128,8 +131,9 @@ else
     echo "already installed: $INSTALL"
 fi
 [ -x "$INSTALL/bin/rexglue" ] || fail "the SDK was not installed"
-# CMake 4 rewrites install rpaths in place, which leaves the linker's
-# ad-hoc signature invalid; arm64 dyld will not load such a file.
+# Installing rewrites rpaths in place. A file whose signature no longer
+# verifies (an older install, or another install_name_tool) would not load
+# on arm64, so re-sign any such file.
 for f in "$INSTALL"/bin/* "$INSTALL"/lib/*.dylib; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
     file -b "$f" | grep -q '^Mach-O' || continue
