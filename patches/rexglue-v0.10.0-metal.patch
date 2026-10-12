@@ -1,0 +1,1129 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index af378d8..3140d97 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -42,8 +42,15 @@ else()
+     option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" ON)
+ endif()
+ 
+-if(NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN)
+-    message(FATAL_ERROR "At least one graphics backend must be enabled (REXGLUE_USE_D3D12 or REXGLUE_USE_VULKAN)")
++if(APPLE)
++    option(REXGLUE_USE_METAL "Enable native Metal graphics backend" ON)
++else()
++    set(REXGLUE_USE_METAL OFF CACHE BOOL "Enable native Metal graphics backend (Apple only)" FORCE)
++    set(REXGLUE_USE_METAL OFF)
++endif()
++
++if(NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN AND NOT REXGLUE_USE_METAL)
++    message(FATAL_ERROR "At least one graphics backend must be enabled (REXGLUE_USE_D3D12, REXGLUE_USE_VULKAN or REXGLUE_USE_METAL)")
+ endif()
+ 
+ if (REXGLUE_ENABLE_FIDELITYFX AND
+@@ -245,7 +252,11 @@ if(REXGLUE_BUILD_TESTS)
+     list(APPEND CMAKE_MODULE_PATH "${REXGLUE_ROOT}/thirdparty/catch2/extras")
+ endif()
+ 
+-# Third-party dependencies (vendored sources only)
++if(APPLE AND REXGLUE_USE_METAL)
++    include(cmake/rexglue_metal.cmake)
++endif()
++
++# Third-party dependencies
+ add_subdirectory(thirdparty)
+ 
+ # Enable warnings after thirdparty
+@@ -284,7 +295,7 @@ message(STATUS "  Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSIO
+ message(STATUS "  Configurations: ${CMAKE_CONFIGURATION_TYPES}")
+ message(STATUS "  Output Dir: ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+ message(STATUS "  C++ Standard: C++${CMAKE_CXX_STANDARD}")
+-message(STATUS "  Graphics: D3D12=${REXGLUE_USE_D3D12} Vulkan=${REXGLUE_USE_VULKAN}")
++message(STATUS "  Graphics: D3D12=${REXGLUE_USE_D3D12} Vulkan=${REXGLUE_USE_VULKAN} Metal=${REXGLUE_USE_METAL}")
+ message(STATUS "  FidelityFX: ${REXGLUE_ENABLE_FIDELITYFX}")
+ message(STATUS "  Tracy: ${REXGLUE_ENABLE_TRACY}")
+ message(STATUS "  Perf Counters: ${REXGLUE_ENABLE_PERF_COUNTERS}")
+diff --git a/cmake/rexglue_metal.cmake b/cmake/rexglue_metal.cmake
+new file mode 100644
+index 0000000..e94d794
+--- /dev/null
++++ b/cmake/rexglue_metal.cmake
+@@ -0,0 +1,15 @@
++# Headers only; the implementation is compiled once, into rexruntime via rexui.
++include(FetchContent)
++FetchContent_Declare(rexglue_metal_cpp
++    GIT_REPOSITORY https://github.com/apple/metal-cpp.git
++    GIT_TAG 27c4382b7151d55a51692cdcb27aaa98752240de
++    GIT_SHALLOW FALSE
++    SOURCE_SUBDIR rexglue-headers-only
++)
++FetchContent_MakeAvailable(rexglue_metal_cpp)
++set(REXGLUE_METAL_CPP_INCLUDE_DIR "${rexglue_metal_cpp_SOURCE_DIR}")
++set(REXGLUE_METAL_FRAMEWORKS
++    "-framework Metal"
++    "-framework QuartzCore"
++    "-framework Foundation"
++)
+diff --git a/include/rex/graphics/metal/command_processor.h b/include/rex/graphics/metal/command_processor.h
+new file mode 100644
+index 0000000..6b3e254
+--- /dev/null
++++ b/include/rex/graphics/metal/command_processor.h
+@@ -0,0 +1,33 @@
++#pragma once
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++
++#include <cstdint>
++#include <memory>
++#include <unordered_map>
++#include <rex/graphics/command_processor.h>
++
++namespace rex::graphics::metal {
++class MetalCommandProcessor final : public CommandProcessor {
++ public:
++  MetalCommandProcessor(GraphicsSystem* graphics, system::KernelState* kernel);
++  ~MetalCommandProcessor() override;
++  void IssueSwap(uint32_t frontbuffer_ptr, uint32_t width, uint32_t height) override;
++
++ protected:
++  bool SetupContext() override;
++  void ShutdownContext() override;
++  Shader* LoadShader(xenos::ShaderType type, uint32_t guest_address,
++                     const uint32_t* host_address, uint32_t dword_count) override;
++  bool IssueDraw(xenos::PrimitiveType primitive, uint32_t index_count,
++                 IndexBufferInfo* index_buffer, bool major_mode_explicit) override;
++  bool IssueCopy() override;
++
++ private:
++  std::unordered_multimap<uint64_t, std::unique_ptr<Shader>> shaders_;
++  uint64_t draws_ = 0;
++  uint64_t copies_ = 0;
++  uint64_t swaps_ = 0;
++  bool swap_failure_logged_ = false;
++};
++}  // namespace rex::graphics::metal
++#endif
+diff --git a/include/rex/graphics/metal/graphics_system.h b/include/rex/graphics/metal/graphics_system.h
+new file mode 100644
+index 0000000..d0e738f
+--- /dev/null
++++ b/include/rex/graphics/metal/graphics_system.h
+@@ -0,0 +1,16 @@
++#pragma once
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++
++#include <rex/graphics/graphics_system.h>
++
++namespace rex::graphics::metal {
++class MetalGraphicsSystem final : public GraphicsSystem {
++ public:
++  std::string name() const override { return "Metal"; }
++
++ protected:
++  void CreateProvider(bool with_presentation) override;
++  std::unique_ptr<CommandProcessor> CreateCommandProcessor() override;
++};
++}  // namespace rex::graphics::metal
++#endif
+diff --git a/include/rex/ui/metal/immediate_drawer.h b/include/rex/ui/metal/immediate_drawer.h
+new file mode 100644
+index 0000000..641b7b5
+--- /dev/null
++++ b/include/rex/ui/metal/immediate_drawer.h
+@@ -0,0 +1,47 @@
++#pragma once
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++
++#include <rex/ui/immediate_drawer.h>
++
++namespace MTL {
++class Buffer;
++class Texture;
++class RenderPipelineState;
++class RenderCommandEncoder;
++}
++
++namespace rex::ui::metal {
++class MetalProvider;
++
++class MetalImmediateDrawer final : public ImmediateDrawer {
++ public:
++  explicit MetalImmediateDrawer(MetalProvider& provider);
++  ~MetalImmediateDrawer() override;
++  bool Initialize();
++
++  std::unique_ptr<ImmediateTexture> CreateTexture(
++      uint32_t width, uint32_t height, ImmediateTextureFilter filter,
++      bool is_repeated, const uint8_t* data) override;
++  // Retains guest output, ignores its alpha, and uses a linear clamp sampler.
++  std::unique_ptr<ImmediateTexture> WrapTexture(MTL::Texture* texture);
++
++  void Begin(UIDrawContext& context, float width, float height) override;
++  void BeginDrawBatch(const ImmediateDrawBatch& batch) override;
++  void Draw(const ImmediateDraw& draw) override;
++  void EndDrawBatch() override;
++  void End() override;
++
++ private:
++  class Texture;
++  MetalProvider& provider_;
++  MTL::RenderPipelineState* pipeline_ = nullptr;
++  std::unique_ptr<ImmediateTexture> white_;
++  MTL::RenderCommandEncoder* encoder_ = nullptr;  // Borrowed within Begin/End.
++  MTL::Buffer* vertices_ = nullptr;
++  MTL::Buffer* indices_ = nullptr;
++  int vertex_count_ = 0;
++  int index_count_ = 0;
++  bool indexed_ = false;
++};
++}  // namespace rex::ui::metal
++#endif
+diff --git a/include/rex/ui/metal/presenter.h b/include/rex/ui/metal/presenter.h
+new file mode 100644
+index 0000000..1f2635b
+--- /dev/null
++++ b/include/rex/ui/metal/presenter.h
+@@ -0,0 +1,77 @@
++#pragma once
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++
++#include <array>
++#include <rex/ui/presenter.h>
++
++namespace MTL {
++class Texture;
++class CommandBuffer;
++class RenderCommandEncoder;
++}
++
++namespace rex::ui::metal {
++class MetalProvider;
++class MetalImmediateDrawer;
++
++class MetalUIDrawContext final : public UIDrawContext {
++ public:
++  MetalUIDrawContext(Presenter& presenter, uint32_t width, uint32_t height,
++                     MTL::RenderCommandEncoder* encoder)
++      : UIDrawContext(presenter, width, height), encoder_(encoder) {}
++  MTL::RenderCommandEncoder* encoder() const { return encoder_; }
++
++ private:
++  MTL::RenderCommandEncoder* encoder_;
++};
++
++class MetalGuestOutputRefreshContext final : public Presenter::GuestOutputRefreshContext {
++ public:
++  // Borrowed until the refresher returns. Write every pixel, end all encoders,
++  // then call SubmitAndWait before returning true. Never commit directly.
++  // M2 may blit a resolved BGRA8 texture into texture() using command_buffer().
++  MTL::Texture* texture() const { return texture_; }
++  MTL::CommandBuffer* command_buffer() const { return command_buffer_; }
++  bool SubmitAndWait();
++  bool Clear(double red, double green, double blue);
++
++ private:
++  friend class MetalPresenter;
++  MetalGuestOutputRefreshContext(bool& is_8bpc, MTL::Texture* texture,
++                                MTL::CommandBuffer* command_buffer)
++      : GuestOutputRefreshContext(is_8bpc),
++        texture_(texture), command_buffer_(command_buffer) {}
++  MTL::Texture* texture_;
++  MTL::CommandBuffer* command_buffer_;
++  bool submitted_ = false;
++  bool completed_ = false;
++};
++
++class MetalPresenter final : public Presenter {
++ public:
++  MetalPresenter(MetalProvider& provider, HostGpuLossCallback callback);
++  ~MetalPresenter() override;
++  bool Initialize();
++  Surface::TypeFlags GetSupportedSurfaceTypes() const override;
++  bool CaptureGuestOutput(RawImage& image_out) override;
++
++ protected:
++  SurfacePaintConnectResult ConnectOrReconnectPaintingToSurfaceFromUIThread(
++      Surface& surface, uint32_t width, uint32_t height, bool was_paintable,
++      bool& is_vsync_implicit_out) override;
++  void DisconnectPaintingFromSurfaceFromUIThreadImpl() override;
++  bool RefreshGuestOutputImpl(
++      uint32_t index, uint32_t width, uint32_t height,
++      std::function<bool(GuestOutputRefreshContext&)> refresher,
++      bool& is_8bpc_out) override;
++  PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
++
++ private:
++  MetalProvider& provider_;
++  void* layer_ = nullptr;  // Retained CAMetalLayer; touched only in the .mm.
++  bool vsync_ = true;
++  std::array<MTL::Texture*, kGuestOutputMailboxSize> guest_textures_{};
++  std::unique_ptr<MetalImmediateDrawer> guest_drawer_;
++};
++}  // namespace rex::ui::metal
++#endif
+diff --git a/include/rex/ui/metal/provider.h b/include/rex/ui/metal/provider.h
+new file mode 100644
+index 0000000..dab5541
+--- /dev/null
++++ b/include/rex/ui/metal/provider.h
+@@ -0,0 +1,32 @@
++#pragma once
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++
++#include <memory>
++#include <rex/ui/graphics_provider.h>
++
++namespace MTL {
++class Device;
++class CommandQueue;
++}
++
++namespace rex::ui::metal {
++class MetalProvider final : public GraphicsProvider {
++ public:
++  static std::unique_ptr<MetalProvider> Create();
++  ~MetalProvider() override;
++
++  std::unique_ptr<Presenter> CreatePresenter(
++      Presenter::HostGpuLossCallback callback =
++          Presenter::FatalErrorHostGpuLossCallback) override;
++  std::unique_ptr<ImmediateDrawer> CreateImmediateDrawer() override;
++
++  MTL::Device* device() const { return device_; }
++  MTL::CommandQueue* queue() const { return queue_; }
++
++ private:
++  MetalProvider() = default;
++  MTL::Device* device_ = nullptr;
++  MTL::CommandQueue* queue_ = nullptr;
++};
++}  // namespace rex::ui::metal
++#endif
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 3e873dc..29d4d66 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -126,6 +126,9 @@ endif()
+ if(REXGLUE_USE_VULKAN)
+     target_compile_definitions(rexcore PUBLIC REX_HAS_VULKAN=1)
+ endif()
++if(APPLE AND REXGLUE_USE_METAL)
++    target_compile_definitions(rexcore PUBLIC REX_HAS_METAL=1)
++endif()
+ 
+ if(REXGLUE_ENABLE_TRACY)
+     target_link_libraries(rexcore PUBLIC
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index 6978e3f..2755f8a 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -96,6 +96,13 @@ if(REXGLUE_USE_D3D12)
+         ${REXGPU_XENOS_D3D12_SOURCES})
+ endif()
+ 
++if(APPLE AND REXGLUE_USE_METAL)
++    list(APPEND REXGPU_XENOS_SOURCES
++        metal/graphics_system.cpp
++        metal/command_processor.cpp
++    )
++endif()
++
+ # On PS5 the GPU implementation is linked in, not loaded as a plugin.
+ if(PS5)
+     add_library(rexgpu-xenos STATIC ${REXGPU_XENOS_SOURCES})
+@@ -143,6 +150,10 @@ target_link_libraries(rexgpu-xenos PRIVATE
+     xxHash::xxhash
+ )
+ 
++if(APPLE AND REXGLUE_USE_METAL)
++    target_link_libraries(rexgpu-xenos PRIVATE ${REXGLUE_METAL_FRAMEWORKS})
++endif()
++
+ if(REXGLUE_USE_VULKAN)
+     target_link_libraries(rexgpu-xenos PRIVATE
+         Vulkan::Headers
+diff --git a/src/graphics/metal/command_processor.cpp b/src/graphics/metal/command_processor.cpp
+new file mode 100644
+index 0000000..dda1220
+--- /dev/null
++++ b/src/graphics/metal/command_processor.cpp
+@@ -0,0 +1,97 @@
++#include <rex/graphics/metal/command_processor.h>
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++
++#include <chrono>
++#include <cmath>
++#include <utility>
++#include <xxhash.h>
++#include <rex/graphics/graphics_system.h>
++#include <rex/graphics/pipeline/shader/shader.h>
++#include <rex/logging.h>
++#include <rex/perf/counter.h>
++#include <rex/ui/metal/presenter.h>
++#include <rex/ui/metal/provider.h>
++
++namespace rex::graphics::metal {
++MetalCommandProcessor::MetalCommandProcessor(GraphicsSystem* graphics, system::KernelState* kernel)
++    : CommandProcessor(graphics, kernel) {}
++MetalCommandProcessor::~MetalCommandProcessor() = default;
++
++bool MetalCommandProcessor::SetupContext() {
++  if (!CommandProcessor::SetupContext()) return false;
++  auto* provider = static_cast<ui::metal::MetalProvider*>(graphics_system_->provider());
++  if (!provider || !provider->device() || !provider->queue()) {
++    REXLOG_ERROR("Metal command processor: missing provider");
++    return false;
++  }
++  REXLOG_WARN("Metal milestone 1: guest draws/copies are counted but not rendered");
++  return true;
++}
++
++void MetalCommandProcessor::ShutdownContext() {
++  REXLOG_INFO("Metal M1 counts: draws={}, copies={}, swaps={}", draws_, copies_, swaps_);
++  active_vertex_shader_ = active_pixel_shader_ = nullptr;
++  shaders_.clear();
++  CommandProcessor::ShutdownContext();
++}
++
++Shader* MetalCommandProcessor::LoadShader(xenos::ShaderType type, uint32_t,
++                                         const uint32_t* host_address, uint32_t dword_count) {
++  if (!host_address || !dword_count) return nullptr;
++  uint64_t hash = XXH3_64bits(host_address, size_t(dword_count) * sizeof(uint32_t));
++  // Shader copies big-endian guest microcode into owned native-endian storage.
++  auto shader = std::make_unique<Shader>(type, hash, host_address, dword_count);
++  auto range = shaders_.equal_range(hash);
++  for (auto it = range.first; it != range.second; ++it) {
++    if (it->second->type() == type && it->second->ucode_data() == shader->ucode_data()) {
++      return it->second.get();
++    }
++  }
++  auto* result = shader.get();
++  shaders_.emplace(hash, std::move(shader));
++  return result;
++}
++
++bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType, uint32_t,
++                                      IndexBufferInfo*, bool) {
++  // The base packet decoder calls IssueDraw for copy-mode draws too.
++  if (register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
++    return IssueCopy();
++  }
++  ++draws_;
++  PROFILE_DRAW_CALL();
++  return true;
++}
++
++bool MetalCommandProcessor::IssueCopy() {
++  ++copies_;
++  PROFILE_DRAW_CALL();
++  return true;
++}
++
++void MetalCommandProcessor::IssueSwap(uint32_t, uint32_t width, uint32_t height) {
++  ++swaps_;
++  auto* presenter = graphics_system_->presenter();
++  if (!presenter) return;  // Headless guest GPU.
++  if (!width || !height) {
++    presenter->RefreshGuestOutput(0, 0, 0, 0, {});
++    return;
++  }
++  double phase = std::chrono::duration<double>(
++      std::chrono::steady_clock::now().time_since_epoch()).count() * 0.25;
++  bool refreshed = presenter->RefreshGuestOutput(width, height, width, height,
++      [phase](ui::Presenter::GuestOutputRefreshContext& context) {
++        auto& metal = static_cast<ui::metal::MetalGuestOutputRefreshContext&>(context);
++        return metal.Clear(0.10 + 0.06 * std::sin(phase),
++                           0.14 + 0.06 * std::sin(phase + 2.0),
++                           0.22 + 0.06 * std::sin(phase + 4.0));
++      });
++  if (!refreshed && !swap_failure_logged_) {
++    REXLOG_ERROR("Metal guest-output refresh failed");
++    swap_failure_logged_ = true;
++  } else if (refreshed) {
++    swap_failure_logged_ = false;
++  }
++}
++}  // namespace rex::graphics::metal
++#endif
+diff --git a/src/graphics/metal/graphics_system.cpp b/src/graphics/metal/graphics_system.cpp
+new file mode 100644
+index 0000000..1a15ca3
+--- /dev/null
++++ b/src/graphics/metal/graphics_system.cpp
+@@ -0,0 +1,16 @@
++#include <rex/graphics/metal/graphics_system.h>
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++
++#include <rex/graphics/metal/command_processor.h>
++#include <rex/ui/metal/provider.h>
++
++namespace rex::graphics::metal {
++void MetalGraphicsSystem::CreateProvider(bool) {
++  provider_ = ui::metal::MetalProvider::Create();
++}
++
++std::unique_ptr<CommandProcessor> MetalGraphicsSystem::CreateCommandProcessor() {
++  return std::make_unique<MetalCommandProcessor>(this, kernel_state_);
++}
++}  // namespace rex::graphics::metal
++#endif
+diff --git a/src/graphics/plugin_main.cpp b/src/graphics/plugin_main.cpp
+index ec756d3..59d3fa5 100644
+--- a/src/graphics/plugin_main.cpp
++++ b/src/graphics/plugin_main.cpp
+@@ -20,6 +20,9 @@
+ #if REX_HAS_VULKAN
+ #include <rex/graphics/vulkan/graphics_system.h>
+ #endif
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++#include <rex/graphics/metal/graphics_system.h>
++#endif
+ 
+ extern "C" REX_GPU_PLUGIN_EXPORT uint32_t rex_gpu_abi_version(void) {
+   return rex::system::kGpuPluginAbiVersion;
+@@ -47,6 +50,12 @@ extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
+   if (backend == "any" || backend == "vulkan") {
+     return new rex::graphics::vulkan::VulkanGraphicsSystem();
+   }
++#endif
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++  // Metal remains opt-in until guest rendering is implemented.
++  if (backend == "metal") {
++    return new rex::graphics::metal::MetalGraphicsSystem();
++  }
+ #endif
+   REXLOG_ERROR("rexgpu-xenos: requested backend '{}' is not compiled into this plugin", backend);
+   return nullptr;
+diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
+index 5f57565..cb7d96c 100644
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -129,3 +129,7 @@ if(REXGLUE_USE_VULKAN)
+     )
+     target_compile_definitions(rexruntime PUBLIC REX_HAS_VULKAN=1)
+ endif()
++if(APPLE AND REXGLUE_USE_METAL)
++    target_compile_definitions(rexruntime PUBLIC REX_HAS_METAL=1)
++    target_link_libraries(rexruntime PRIVATE ${REXGLUE_METAL_FRAMEWORKS})
++endif()
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 5e450f4..8e410d9 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -99,6 +99,21 @@ endif()
+ add_library(rexui OBJECT ${REXUI_SOURCES})
+ add_library(rex::ui ALIAS rexui)
+ 
++if(APPLE AND REXGLUE_USE_METAL)
++    target_sources(rexui PRIVATE
++        metal/metal_api.cpp
++        metal/provider.cpp
++        metal/presenter.mm
++        metal/immediate_drawer.cpp
++    )
++    target_include_directories(rexui SYSTEM PRIVATE ${REXGLUE_METAL_CPP_INCLUDE_DIR})
++    target_link_libraries(rexui PRIVATE ${REXGLUE_METAL_FRAMEWORKS})
++    set_target_properties(rexui PROPERTIES OBJCXX_STANDARD 23 OBJCXX_STANDARD_REQUIRED ON)
++    set_source_files_properties(metal/metal_api.cpp metal/presenter.mm
++        PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
++    set_source_files_properties(metal/presenter.mm PROPERTIES COMPILE_OPTIONS "-fno-objc-arc")
++endif()
++
+ rex_target_pch(rexui <rex/math.h>)
+ 
+ target_include_directories(rexui PUBLIC
+diff --git a/src/ui/metal/immediate_drawer.cpp b/src/ui/metal/immediate_drawer.cpp
+new file mode 100644
+index 0000000..4a0250a
+--- /dev/null
++++ b/src/ui/metal/immediate_drawer.cpp
+@@ -0,0 +1,221 @@
++#include <rex/ui/metal/immediate_drawer.h>
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++
++#include <cstddef>
++#include <vector>
++#include <rex/ui/metal/presenter.h>
++#include <rex/ui/metal/provider.h>
++#include "metal_util.h"
++
++namespace rex::ui::metal {
++namespace {
++// Packed fields match ImmediateVertex's 20-byte layout, including ImGui RGBA.
++constexpr char kShader[] = R"msl(
++#include <metal_stdlib>
++using namespace metal;
++struct Vertex { packed_float2 position; packed_float2 uv; uint color; };
++struct Out { float4 position [[position]]; float2 uv; float4 color; };
++vertex Out ui_vertex(uint id [[vertex_id]],
++                     const device Vertex* vertices [[buffer(0)]],
++                     constant float2& inverse_size [[buffer(1)]]) {
++  Vertex v = vertices[id];
++  Out o;
++  o.position = float4(float2(v.position) * inverse_size * float2(2, -2)
++                      + float2(-1, 1), 0, 1);
++  o.uv = float2(v.uv);
++  o.color = float4(v.color & 255u, (v.color >> 8) & 255u,
++                   (v.color >> 16) & 255u, v.color >> 24) / 255.0;
++  return o;
++}
++fragment float4 ui_fragment(Out in [[stage_in]], texture2d<float> tex [[texture(0)]],
++                            sampler sam [[sampler(0)]],
++                            constant uint& opaque [[buffer(0)]]) {
++  float4 texel = tex.sample(sam, in.uv);
++  if (opaque) texel.a = 1;
++  return in.color * texel;
++}
++)msl";
++static_assert(sizeof(ImmediateVertex) == 20);
++static_assert(offsetof(ImmediateVertex, u) == 8);
++static_assert(offsetof(ImmediateVertex, color) == 16);
++}  // namespace
++
++class MetalImmediateDrawer::Texture final : public ImmediateTexture {
++ public:
++  Texture(uint32_t width, uint32_t height, MTL::Texture* texture, MTL::SamplerState* sampler)
++      : ImmediateTexture(width, height), texture(texture), sampler(sampler) {}
++  ~Texture() override {
++    ReleaseObject(texture);
++    ReleaseObject(sampler);
++  }
++  MTL::Texture* texture;
++  MTL::SamplerState* sampler;
++  bool opaque = false;
++};
++
++MetalImmediateDrawer::MetalImmediateDrawer(MetalProvider& provider) : provider_(provider) {}
++MetalImmediateDrawer::~MetalImmediateDrawer() {
++  EndDrawBatch();
++  ReleaseObject(pipeline_);
++}
++
++bool MetalImmediateDrawer::Initialize() {
++  auto pool = Adopt(NS::AutoreleasePool::alloc()->init());
++  NS::Error* error = nullptr;
++  // metal-cpp's newLibrary(source, options, error) wraps newLibraryWithSource.
++  auto library = Adopt(provider_.device()->newLibrary(
++      NS::String::string(kShader, NS::UTF8StringEncoding), nullptr, &error));
++  if (!library) {
++    REXLOG_ERROR("Metal UI shader compilation failed: {}",
++                 ErrorText(error));
++    return false;
++  }
++  auto vertex = Adopt(library->newFunction(
++      NS::String::string("ui_vertex", NS::UTF8StringEncoding)));
++  auto fragment = Adopt(library->newFunction(
++      NS::String::string("ui_fragment", NS::UTF8StringEncoding)));
++  if (!vertex || !fragment) return false;
++  auto descriptor = Adopt(MTL::RenderPipelineDescriptor::alloc()->init());
++  descriptor->setVertexFunction(vertex.get());
++  descriptor->setFragmentFunction(fragment.get());
++  auto* color = descriptor->colorAttachments()->object(0);
++  color->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
++  color->setBlendingEnabled(true);
++  color->setRgbBlendOperation(MTL::BlendOperationAdd);
++  color->setAlphaBlendOperation(MTL::BlendOperationAdd);
++  color->setSourceRGBBlendFactor(MTL::BlendFactorSourceAlpha);
++  color->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
++  color->setSourceAlphaBlendFactor(MTL::BlendFactorOne);
++  color->setDestinationAlphaBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
++  pipeline_ = provider_.device()->newRenderPipelineState(descriptor.get(), &error);
++  if (!pipeline_) {
++    REXLOG_ERROR("Metal UI pipeline creation failed: {}",
++                 ErrorText(error));
++    return false;
++  }
++  const uint8_t white[4] = {255, 255, 255, 255};
++  white_ = CreateTexture(1, 1, ImmediateTextureFilter::kLinear, false, white);
++  return white_ != nullptr;
++}
++
++std::unique_ptr<ImmediateTexture> MetalImmediateDrawer::CreateTexture(
++    uint32_t width, uint32_t height, ImmediateTextureFilter filter,
++    bool is_repeated, const uint8_t* data) {
++  if (!width || !height || width > 16384 || height > 16384) return nullptr;
++  auto pool = Adopt(NS::AutoreleasePool::alloc()->init());
++  auto descriptor = Adopt(MTL::TextureDescriptor::alloc()->init());
++  descriptor->setTextureType(MTL::TextureType2D);
++  descriptor->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
++  descriptor->setWidth(width);
++  descriptor->setHeight(height);
++  descriptor->setUsage(MTL::TextureUsageShaderRead);
++  descriptor->setStorageMode(provider_.device()->hasUnifiedMemory()
++                                 ? MTL::StorageModeShared : MTL::StorageModeManaged);
++  auto texture = Adopt(provider_.device()->newTexture(descriptor.get()));
++  if (!texture) return nullptr;
++  std::vector<uint8_t> zeroes;
++  if (!data) {
++    zeroes.resize(size_t(width) * height * 4);
++    data = zeroes.data();
++  }
++  texture->replaceRegion(MTL::Region(0, 0, width, height), 0, data, size_t(width) * 4);
++  auto sampler_descriptor = Adopt(MTL::SamplerDescriptor::alloc()->init());
++  auto metal_filter = filter == ImmediateTextureFilter::kNearest
++                          ? MTL::SamplerMinMagFilterNearest : MTL::SamplerMinMagFilterLinear;
++  sampler_descriptor->setMinFilter(metal_filter);
++  sampler_descriptor->setMagFilter(metal_filter);
++  sampler_descriptor->setNormalizedCoordinates(true);
++  auto address = is_repeated ? MTL::SamplerAddressModeRepeat : MTL::SamplerAddressModeClampToEdge;
++  sampler_descriptor->setSAddressMode(address);
++  sampler_descriptor->setTAddressMode(address);
++  auto sampler = Adopt(provider_.device()->newSamplerState(sampler_descriptor.get()));
++  if (!sampler) return nullptr;
++  return std::make_unique<Texture>(width, height, texture.release(), sampler.release());
++}
++
++std::unique_ptr<ImmediateTexture> MetalImmediateDrawer::WrapTexture(MTL::Texture* texture) {
++  if (!texture || !white_) return nullptr;
++  auto* sampler = static_cast<Texture*>(white_.get())->sampler;
++  texture->retain();
++  sampler->retain();
++  auto wrapped = std::make_unique<Texture>(uint32_t(texture->width()), uint32_t(texture->height()),
++                                           texture, sampler);
++  wrapped->opaque = true;
++  return wrapped;
++}
++
++void MetalImmediateDrawer::Begin(UIDrawContext& context, float width, float height) {
++  ImmediateDrawer::Begin(context, width, height);
++  encoder_ = static_cast<MetalUIDrawContext&>(context).encoder();
++  encoder_->setRenderPipelineState(pipeline_);
++  encoder_->setCullMode(MTL::CullModeNone);
++  encoder_->setViewport(MTL::Viewport{0, 0, double(context.render_target_width()),
++                                     double(context.render_target_height()), 0, 1});
++  const float inverse_size[] = {1.0f / coordinate_space_width(), 1.0f / coordinate_space_height()};
++  encoder_->setVertexBytes(inverse_size, sizeof(inverse_size), 1);
++}
++
++void MetalImmediateDrawer::BeginDrawBatch(const ImmediateDrawBatch& batch) {
++  EndDrawBatch();
++  if (!encoder_ || !batch.vertices || batch.vertex_count <= 0 || batch.index_count < 0) return;
++  vertices_ = provider_.device()->newBuffer(batch.vertices,
++      size_t(batch.vertex_count) * sizeof(ImmediateVertex), MTL::ResourceStorageModeShared);
++  if (!vertices_) return;
++  vertex_count_ = batch.vertex_count;
++  indexed_ = batch.index_count > 0;
++  if (indexed_) {
++    if (!batch.indices) { EndDrawBatch(); return; }
++    indices_ = provider_.device()->newBuffer(batch.indices,
++        size_t(batch.index_count) * sizeof(uint16_t), MTL::ResourceStorageModeShared);
++    if (!indices_) { EndDrawBatch(); return; }
++    index_count_ = batch.index_count;
++  }
++  encoder_->setVertexBuffer(vertices_, 0, 0);
++}
++
++void MetalImmediateDrawer::Draw(const ImmediateDraw& draw) {
++  if (!encoder_ || !vertices_ || draw.count <= 0 || draw.base_vertex < 0) return;
++  if (indexed_) {
++    if (draw.index_offset < 0 || draw.index_offset > index_count_ ||
++        draw.count > index_count_ - draw.index_offset) return;
++    // Avoid a malformed debug-overlay batch reading outside its vertex buffer.
++    const auto* indices = static_cast<const uint16_t*>(indices_->contents()) + draw.index_offset;
++    for (int i = 0; i < draw.count; ++i) {
++      if (uint64_t(draw.base_vertex) + indices[i] >= uint64_t(vertex_count_)) return;
++    }
++  } else if (draw.base_vertex > vertex_count_ || draw.count > vertex_count_ - draw.base_vertex) {
++    return;
++  }
++  uint32_t left, top, width, height;
++  if (!ScissorToRenderTarget(draw, left, top, width, height)) return;
++  encoder_->setScissorRect(MTL::ScissorRect{left, top, width, height});
++  auto* texture = static_cast<Texture*>(draw.texture ? draw.texture : white_.get());
++  uint32_t opaque = texture->opaque ? 1 : 0;
++  encoder_->setFragmentBytes(&opaque, sizeof(opaque), 0);
++  encoder_->setFragmentTexture(texture->texture, 0);
++  encoder_->setFragmentSamplerState(texture->sampler, 0);
++  auto primitive = draw.primitive_type == ImmediatePrimitiveType::kLines
++                       ? MTL::PrimitiveTypeLine : MTL::PrimitiveTypeTriangle;
++  if (indexed_) {
++    encoder_->drawIndexedPrimitives(primitive, NS::UInteger(draw.count), MTL::IndexTypeUInt16,
++        indices_, size_t(draw.index_offset) * sizeof(uint16_t), 1, draw.base_vertex, 0);
++  } else {
++    encoder_->drawPrimitives(primitive, NS::UInteger(draw.base_vertex), NS::UInteger(draw.count));
++  }
++}
++
++void MetalImmediateDrawer::EndDrawBatch() {
++  // commandBuffer() retains bound resources through GPU completion.
++  ReleaseObject(vertices_);
++  ReleaseObject(indices_);
++  vertex_count_ = index_count_ = 0;
++  indexed_ = false;
++}
++
++void MetalImmediateDrawer::End() {
++  EndDrawBatch();
++  encoder_ = nullptr;
++  ImmediateDrawer::End();
++}
++}  // namespace rex::ui::metal
++#endif
+diff --git a/src/ui/metal/metal_api.cpp b/src/ui/metal/metal_api.cpp
+new file mode 100644
+index 0000000..26fcf78
+--- /dev/null
++++ b/src/ui/metal/metal_api.cpp
+@@ -0,0 +1,9 @@
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++// The sole metal-cpp implementation TU. Do not add it to rexgpu-xenos.
++#define NS_PRIVATE_IMPLEMENTATION
++#define MTL_PRIVATE_IMPLEMENTATION
++#define CA_PRIVATE_IMPLEMENTATION
++#include <Foundation/Foundation.hpp>
++#include <Metal/Metal.hpp>
++#include <QuartzCore/QuartzCore.hpp>
++#endif
+diff --git a/src/ui/metal/metal_util.h b/src/ui/metal/metal_util.h
+new file mode 100644
+index 0000000..8cccac8
+--- /dev/null
++++ b/src/ui/metal/metal_util.h
+@@ -0,0 +1,35 @@
++#pragma once
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++
++#include <memory>
++#include <Foundation/Foundation.hpp>
++#include <Metal/Metal.hpp>
++#include <rex/logging.h>
++
++namespace rex::ui::metal {
++struct ObjectReleaser {
++  template <typename T>
++  void operator()(T* object) const { if (object) object->release(); }
++};
++template <typename T>
++auto Adopt(T* object) {
++  return std::unique_ptr<T, ObjectReleaser>(object);
++}
++template <typename T>
++void ReleaseObject(T*& object) {
++  if (object) object->release();
++  object = nullptr;
++}
++inline const char* ErrorText(NS::Error* error) {
++  auto* description = error ? error->localizedDescription() : nullptr;
++  const char* text = description ? description->utf8String() : nullptr;
++  return text ? text : "unknown error";
++}
++inline bool WaitForSubmission(MTL::CommandBuffer* buffer) {
++  buffer->waitUntilCompleted();
++  if (buffer->status() == MTL::CommandBufferStatusCompleted) return true;
++  REXLOG_ERROR("Metal submission failed: {}", ErrorText(buffer->error()));
++  return false;
++}
++}  // namespace rex::ui::metal
++#endif
+diff --git a/src/ui/metal/presenter.mm b/src/ui/metal/presenter.mm
+new file mode 100644
+index 0000000..e96a4c2
+--- /dev/null
++++ b/src/ui/metal/presenter.mm
+@@ -0,0 +1,251 @@
++#include <rex/ui/metal/presenter.h>
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++
++#import <Metal/Metal.h>
++#import <QuartzCore/CAMetalLayer.h>
++
++#include <algorithm>
++#include <utility>
++#include <rex/cvar.h>
++#include <rex/ui/flags.h>
++#include <rex/ui/metal/immediate_drawer.h>
++#include <rex/ui/metal/provider.h>
++#include <rex/ui/surface_mac.h>
++#include "metal_util.h"
++
++namespace rex::ui::metal {
++namespace {
++bool VSyncEnabled() {
++  // The cvar is defined in the GPU plugin; never link the runtime back to it.
++  return !rex::cvar::GetFlagInfo("vsync") || REXCVAR_QUERY(bool, vsync);
++}
++}
++
++bool MetalGuestOutputRefreshContext::SubmitAndWait() {
++  if (!submitted_) {
++    submitted_ = true;
++    command_buffer_->commit();
++    completed_ = WaitForSubmission(command_buffer_);
++  }
++  return completed_;
++}
++
++bool MetalGuestOutputRefreshContext::Clear(double red, double green, double blue) {
++  if (submitted_) return false;
++  auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
++  auto* color = pass->colorAttachments()->object(0);
++  color->setTexture(texture_);
++  color->setLoadAction(MTL::LoadActionClear);
++  color->setStoreAction(MTL::StoreActionStore);
++  color->setClearColor(MTL::ClearColor(red, green, blue, 1));
++  auto* encoder = command_buffer_->renderCommandEncoder(pass);
++  if (!encoder) return false;
++  encoder->endEncoding();
++  SetIs8bpc(true);
++  return SubmitAndWait();
++}
++
++MetalPresenter::MetalPresenter(MetalProvider& provider, HostGpuLossCallback callback)
++    : Presenter(std::move(callback)), provider_(provider) {}
++
++MetalPresenter::~MetalPresenter() {
++  SetWindowSurfaceFromUIThread(nullptr, nullptr);
++  DisconnectPaintingFromSurfaceFromUIThreadImpl();
++  guest_drawer_.reset();
++  for (auto*& texture : guest_textures_) ReleaseObject(texture);
++}
++
++bool MetalPresenter::Initialize() {
++  if (!InitializeCommonSurfaceIndependent()) return false;
++  guest_drawer_ = std::make_unique<MetalImmediateDrawer>(provider_);
++  if (!guest_drawer_->Initialize()) return false;
++  guest_drawer_->SetPresenter(this);
++  return true;
++}
++
++Surface::TypeFlags MetalPresenter::GetSupportedSurfaceTypes() const {
++  return Surface::kTypeFlag_CAMetalLayer;
++}
++
++Presenter::SurfacePaintConnectResult
++MetalPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
++    Surface& surface, uint32_t width, uint32_t height, bool,
++    bool& is_vsync_implicit_out) {
++  @autoreleasepool {
++    DisconnectPaintingFromSurfaceFromUIThreadImpl();
++    if (surface.GetType() != Surface::kTypeIndex_CAMetalLayer || !width || !height) {
++      return SurfacePaintConnectResult::kFailureSurfaceUnusable;
++    }
++    auto* layer = (__bridge CAMetalLayer*)const_cast<void*>(
++        static_cast<CAMetalLayerSurface&>(surface).layer());
++    if (!layer) return SurfacePaintConnectResult::kFailureSurfaceUnusable;
++    layer.device = (__bridge id<MTLDevice>)provider_.device();
++    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
++    layer.framebufferOnly = YES;
++    // PaintAndPresentImpl may run on the guest GPU thread, outside a UI transaction.
++    layer.presentsWithTransaction = NO;
++    layer.opaque = YES;
++    layer.maximumDrawableCount = 3;
++    layer.allowsNextDrawableTimeout = YES;
++    vsync_ = VSyncEnabled();
++    layer.displaySyncEnabled = vsync_;
++    // CAMetalLayerSurface already returns backing pixels, not logical points.
++    layer.drawableSize = CGSizeMake(width, height);
++    [layer retain];
++    layer_ = (__bridge void*)layer;
++    is_vsync_implicit_out = vsync_;
++    REXLOG_INFO("Metal surface: {}x{}, BGRA8, drawables=3, vsync={}", width, height, vsync_);
++    return SurfacePaintConnectResult::kSuccess;
++  }
++}
++
++void MetalPresenter::DisconnectPaintingFromSurfaceFromUIThreadImpl() {
++  if (layer_) {
++    [(__bridge CAMetalLayer*)layer_ release];
++    layer_ = nullptr;
++  }
++}
++
++bool MetalPresenter::RefreshGuestOutputImpl(
++    uint32_t index, uint32_t width, uint32_t height,
++    std::function<bool(GuestOutputRefreshContext&)> refresher, bool& is_8bpc_out) {
++  auto pool = Adopt(NS::AutoreleasePool::alloc()->init());
++  if (index >= guest_textures_.size() || !width || !height ||
++      width > 16384 || height > 16384) return false;
++  auto*& texture = guest_textures_[index];
++  if (!texture || texture->width() != width || texture->height() != height) {
++    auto descriptor = Adopt(MTL::TextureDescriptor::alloc()->init());
++    descriptor->setTextureType(MTL::TextureType2D);
++    descriptor->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
++    descriptor->setWidth(width);
++    descriptor->setHeight(height);
++    descriptor->setStorageMode(MTL::StorageModePrivate);
++    descriptor->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
++    auto* replacement = provider_.device()->newTexture(descriptor.get());
++    if (!replacement) {
++      REXLOG_ERROR("Metal guest texture allocation failed: {}x{}", width, height);
++      return false;
++    }
++    ReleaseObject(texture);
++    texture = replacement;
++  }
++  auto* buffer = provider_.queue()->commandBuffer();
++  if (!buffer) return false;
++  MetalGuestOutputRefreshContext context(is_8bpc_out, texture, buffer);
++  bool refreshed = refresher(context);
++  // Base Presenter publishes this slot immediately after we return true.
++  return refreshed && context.submitted_ && context.completed_;
++}
++
++bool MetalPresenter::CaptureGuestOutput(RawImage& image_out) {
++  auto pool = Adopt(NS::AutoreleasePool::alloc()->init());
++  uint32_t index;
++  auto lock = ConsumeGuestOutput(index, nullptr, nullptr);
++  if (index == UINT32_MAX || !guest_textures_[index]) return false;
++  auto* texture = guest_textures_[index];
++  uint32_t width = uint32_t(texture->width()), height = uint32_t(texture->height());
++  size_t stride = size_t(width) * 4;
++  size_t pitch = (stride + 255) & ~size_t(255);
++  auto staging = Adopt(provider_.device()->newBuffer(pitch * height, MTL::ResourceStorageModeShared));
++  auto* buffer = provider_.queue()->commandBuffer();
++  if (!staging || !buffer) return false;
++  auto* blit = buffer->blitCommandEncoder();
++  if (!blit) return false;
++  blit->copyFromTexture(texture, 0, 0, MTL::Origin(0, 0, 0), MTL::Size(width, height, 1),
++                        staging.get(), 0, pitch, pitch * height);
++  blit->endEncoding();
++  buffer->commit();
++  if (!WaitForSubmission(buffer)) return false;
++  // Keep the mailbox lock through GPU completion. The staging copy is now independent.
++  lock.unlock();
++  RawImage image;
++  image.width = width;
++  image.height = height;
++  image.stride = stride;
++  image.data.resize(stride * height);
++  const auto* source = static_cast<const uint8_t*>(staging->contents());
++  for (uint32_t y = 0; y < height; ++y) {
++    for (uint32_t x = 0; x < width; ++x) {
++      const uint8_t* bgra = source + y * pitch + x * 4;
++      uint8_t* rgba = image.data.data() + y * stride + x * 4;
++      rgba[0] = bgra[2]; rgba[1] = bgra[1]; rgba[2] = bgra[0]; rgba[3] = 255;
++    }
++  }
++  image_out = std::move(image);
++  return true;
++}
++
++Presenter::PaintResult MetalPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
++  @autoreleasepool {
++    if (!layer_) return PaintResult::kNotPresented;
++    if (vsync_ != VSyncEnabled()) return PaintResult::kNotPresentedConnectionOutdated;
++    auto* layer = (__bridge CAMetalLayer*)layer_;
++    id<CAMetalDrawable> drawable = [layer nextDrawable];
++    if (!drawable) return PaintResult::kNotPresented;  // Occluded/minimized/timeout.
++    auto* target = (__bridge MTL::Texture*)drawable.texture;
++    uint32_t width = uint32_t(target->width()), height = uint32_t(target->height());
++    if (!width || !height) return PaintResult::kNotPresented;
++
++    uint32_t index;
++    GuestOutputProperties properties;
++    auto lock = ConsumeGuestOutput(index, &properties, nullptr);
++    auto* buffer = provider_.queue()->commandBuffer();
++    if (!buffer) return PaintResult::kNotPresented;
++    auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
++    auto* color = pass->colorAttachments()->object(0);
++    color->setTexture(target);
++    color->setLoadAction(MTL::LoadActionClear);
++    color->setStoreAction(MTL::StoreActionStore);
++    color->setClearColor(MTL::ClearColor(0, 0, 0, 1));
++    auto* encoder = buffer->renderCommandEncoder(pass);
++    if (!encoder) return PaintResult::kNotPresented;
++    if (index != UINT32_MAX && guest_textures_[index]) {
++      auto texture = guest_drawer_->WrapTexture(guest_textures_[index]);
++      float draw_width = float(width), draw_height = float(height);
++      if (REXCVAR_GET(present_letterbox)) {
++        double aspect = double(properties.display_aspect_ratio_x) / properties.display_aspect_ratio_y;
++        if (double(width) / height > aspect) draw_width = float(height * aspect);
++        else draw_height = float(width / aspect);
++      }
++      float left = (width - draw_width) * 0.5f, top = (height - draw_height) * 0.5f;
++      float right = left + draw_width, bottom = top + draw_height;
++      const ImmediateVertex vertices[] = {
++          {left, top, 0, 0, 0xFFFFFFFF}, {right, top, 1, 0, 0xFFFFFFFF},
++          {left, bottom, 0, 1, 0xFFFFFFFF}, {right, top, 1, 0, 0xFFFFFFFF},
++          {right, bottom, 1, 1, 0xFFFFFFFF}, {left, bottom, 0, 1, 0xFFFFFFFF}};
++      MetalUIDrawContext context(*this, width, height, encoder);
++      guest_drawer_->Begin(context, float(width), float(height));
++      guest_drawer_->BeginDrawBatch(ImmediateDrawBatch{vertices, 6, nullptr, 0});
++      ImmediateDraw draw;
++      draw.count = 6;
++      draw.texture = texture.get();
++      guest_drawer_->Draw(draw);
++      guest_drawer_->End();
++    }
++    encoder->endEncoding();
++    if (!execute_ui_drawers) buffer->presentDrawable((__bridge MTL::Drawable*)drawable);
++    buffer->commit();
++    bool completed = WaitForSubmission(buffer);
++    lock.unlock();
++    if (!completed) return PaintResult::kNotPresented;
++
++    if (execute_ui_drawers) {
++      // UI callbacks may themselves capture guest output. Never call them while
++      // holding the mailbox lock. The guest sampling above has already completed.
++      buffer = provider_.queue()->commandBuffer();
++      if (!buffer) return PaintResult::kNotPresented;
++      color->setLoadAction(MTL::LoadActionLoad);
++      encoder = buffer->renderCommandEncoder(pass);
++      if (!encoder) return PaintResult::kNotPresented;
++      MetalUIDrawContext context(*this, width, height, encoder);
++      ExecuteUIDrawersFromUIThread(context);
++      encoder->endEncoding();
++      buffer->presentDrawable((__bridge MTL::Drawable*)drawable);
++      buffer->commit();
++      if (!WaitForSubmission(buffer)) return PaintResult::kNotPresented;
++    }
++    return PaintResult::kPresented;
++  }
++}
++}  // namespace rex::ui::metal
++#endif
+diff --git a/src/ui/metal/provider.cpp b/src/ui/metal/provider.cpp
+new file mode 100644
+index 0000000..05a5258
+--- /dev/null
++++ b/src/ui/metal/provider.cpp
+@@ -0,0 +1,50 @@
++#include <rex/ui/metal/provider.h>
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++
++#include <utility>
++#include <rex/ui/metal/immediate_drawer.h>
++#include <rex/ui/metal/presenter.h>
++#include "metal_util.h"
++
++namespace rex::ui::metal {
++std::unique_ptr<MetalProvider> MetalProvider::Create() {
++  auto pool = Adopt(NS::AutoreleasePool::alloc()->init());
++  auto provider = std::unique_ptr<MetalProvider>(new MetalProvider());
++  provider->device_ = MTL::CreateSystemDefaultDevice();
++  if (!provider->device_) {
++    REXLOG_ERROR("Metal: no system default device");
++    return nullptr;
++  }
++  provider->queue_ = provider->device_->newCommandQueue();
++  if (!provider->queue_) {
++    REXLOG_ERROR("Metal: command queue creation failed");
++    return nullptr;
++  }
++  auto* device = provider->device_;
++  REXLOG_INFO("GPU backend: Metal (native), device {}", device->name()->utf8String());
++  REXLOG_INFO("Metal families: apple7={}, metal3={}, metal4={}",
++              device->supportsFamily(MTL::GPUFamilyApple7),
++              device->supportsFamily(MTL::GPUFamilyMetal3),
++              device->supportsFamily(MTL::GPUFamilyMetal4));
++  return provider;
++}
++
++MetalProvider::~MetalProvider() {
++  ReleaseObject(queue_);
++  ReleaseObject(device_);
++}
++
++std::unique_ptr<Presenter> MetalProvider::CreatePresenter(
++    Presenter::HostGpuLossCallback callback) {
++  auto presenter = std::make_unique<MetalPresenter>(*this, std::move(callback));
++  if (!presenter->Initialize()) return nullptr;
++  return presenter;
++}
++
++std::unique_ptr<ImmediateDrawer> MetalProvider::CreateImmediateDrawer() {
++  auto drawer = std::make_unique<MetalImmediateDrawer>(*this);
++  if (!drawer->Initialize()) return nullptr;
++  return drawer;
++}
++}  // namespace rex::ui::metal
++#endif

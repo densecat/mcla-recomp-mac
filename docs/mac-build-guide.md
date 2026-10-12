@@ -55,6 +55,7 @@ From the repository folder:
 ```bash
 git clone --recursive --branch v0.10.0 https://github.com/rexglue/rexglue-sdk.git third_party/rexglue-sdk
 git -C third_party/rexglue-sdk apply ../../patches/rexglue-v0.10.0-mcla.patch
+git -C third_party/rexglue-sdk apply ../../patches/rexglue-v0.10.0-metal.patch
 git -C third_party/rexglue-sdk/thirdparty/FFmpeg apply ../../../../patches/rexglue-ffmpeg-ps5-config.patch
 ```
 

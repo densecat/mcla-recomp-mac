@@ -4,6 +4,7 @@ Apply to ReXGlue v0.10.0 (`f5337cdc947ff6d4c4196737e2c807a48f2a1fc2`), from the 
 
 ```
 git apply ../../patches/rexglue-v0.10.0-mcla.patch
+git apply ../../patches/rexglue-v0.10.0-metal.patch
 git -C thirdparty/FFmpeg apply ../../../../patches/rexglue-ffmpeg-ps5-config.patch
 ```
 
@@ -29,6 +30,15 @@ They were separate files at first; they are combined now because several touch t
 | PS5 platform: everything else. Platform detection, libc and libc++ differences, anonymous shared memory with a shared-object address reservation at a kernel-chosen base, 16 KiB host pages, signals without realtime signals, no X11/Wayland/RenderDoc, static runtime and GPU libraries, no desktop install rules | the remaining files | PS5 only, behind `REX_PLATFORM_PS5` or `if(PS5)` |
 
 Details of the PS5 changes are in `docs/ps5-port-plan.md`.
+
+## rexglue-v0.10.0-metal.patch
+
+A native Metal GPU backend for macOS, applied after `rexglue-v0.10.0-mcla.patch`. It is opt-in: `--mcla_gpu_backend=metal` selects it, and `any` still picks Vulkan. Work in progress; see `docs/known-issues.md`.
+
+| Change | Files | Affects |
+|---|---|---|
+| `REXGLUE_USE_METAL` (on for Apple, forced off elsewhere) and `REX_HAS_METAL`; metal-cpp fetched at commit `27c4382b7151d55a51692cdcb27aaa98752240de` | `CMakeLists.txt`, `cmake/rexglue_metal.cmake`, `src/core/CMakeLists.txt`, `src/system/CMakeLists.txt`, `src/ui/CMakeLists.txt`, `src/graphics/CMakeLists.txt` | macOS builds |
+| Milestone 1: Metal provider, presenter (CAMetalLayer) and immediate drawer in the runtime; a `metal` choice in the GPU plugin whose command processor counts guest draws and copies without rendering them and presents a clear color | `include/rex/ui/metal/*`, `src/ui/metal/*`, `include/rex/graphics/metal/*`, `src/graphics/metal/*`, `src/graphics/plugin_main.cpp` | macOS, only when the `metal` backend is chosen |
 
 ## rexglue-ffmpeg-ps5-config.patch
 

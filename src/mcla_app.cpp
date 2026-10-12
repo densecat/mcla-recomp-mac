@@ -16,6 +16,7 @@
 #include <unistd.h>
 #endif
 #ifdef __APPLE__
+#include <rex/assert.h>
 #include <pwd.h>
 #include <sys/sysctl.h>
 #endif
@@ -27,8 +28,13 @@
 #include <rex/runtime.h>
 #include <rex/system/gpu_plugin.h>
 
+#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
+REXCVAR_DEFINE_STRING(mcla_gpu_backend, "any", "MCLA",
+                      "Graphics backend for the Xenos GPU plugin: any, vulkan, d3d12 or metal");
+#else
 REXCVAR_DEFINE_STRING(mcla_gpu_backend, "any", "MCLA",
                       "Graphics backend for the Xenos GPU plugin: any, vulkan or d3d12");
+#endif
 
 
 std::unique_ptr<rex::system::IAudioSystem> CreateMclaAudioSystem(
@@ -111,6 +117,12 @@ void MclaApp::OnPreSetup(rex::RuntimeConfig& config) {
     config.graphics = rex::system::LoadGpuPlugin("xenos", backend);
     if (!config.graphics) {
       REXLOG_ERROR("could not load the xenos GPU plugin with backend '{}'", backend);
+#ifdef __APPLE__
+      if (backend == "metal") {
+        // Prevent ReXApp::SetupPresentation from retrying the default "any" backend.
+        rex::FatalError("The requested native Metal backend could not be loaded. See log.");
+      }
+#endif
     }
   }
 }

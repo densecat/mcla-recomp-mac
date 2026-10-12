@@ -77,10 +77,10 @@ preflight_tools
 
 # -----------------------------------------------------------------------
 step "2/6 ReXGlue SDK $SDK_TAG with this project's patches"
-# The marker holds a hash of both patches, so after a `git pull` that changes
+# The marker holds a hash of the patches, so after a `git pull` that changes
 # them the checkout is restored to the release and patched again, and the newer
 # marker makes step 3 rebuild. Build trees under out/ are kept.
-patches_hash="$(cat "$ROOT/patches/rexglue-v0.10.0-mcla.patch" "$ROOT/patches/rexglue-ffmpeg-ps5-config.patch" | shasum -a 256 | cut -c1-64)"
+patches_hash="$(cat "$ROOT/patches/rexglue-v0.10.0-mcla.patch" "$ROOT/patches/rexglue-v0.10.0-metal.patch" "$ROOT/patches/rexglue-ffmpeg-ps5-config.patch" | shasum -a 256 | cut -c1-64)"
 if [ -e "$MARKER" ] && [ "$(cat "$MARKER")" != "$patches_hash" ]; then
     echo "the patches changed: restoring $SDK to $SDK_TAG and patching it again"
     logged sdk-unpatch git -C "$SDK" checkout -- .
@@ -96,6 +96,7 @@ if [ ! -e "$MARKER" ]; then
     fi
     [ "$(git -C "$SDK" rev-parse HEAD)" = "$SDK_COMMIT" ] || fail "the SDK checkout is not $SDK_TAG ($SDK_COMMIT)"
     patch_in sdk-patch "$SDK" "$ROOT/patches/rexglue-v0.10.0-mcla.patch"
+    patch_in sdk-patch-metal "$SDK" "$ROOT/patches/rexglue-v0.10.0-metal.patch"
     patch_in sdk-patch-ffmpeg "$SDK/thirdparty/FFmpeg" "$ROOT/patches/rexglue-ffmpeg-ps5-config.patch"
     echo "$patches_hash" > "$MARKER"
 else
