@@ -34,6 +34,7 @@
 ## Targets
 
 - **PC**: Windows today (D3D12 by default). Vulkan and Linux are next, because Vulkan is the only backend the PS5 can use.
+- **macOS arm64**: Apple Silicon, macOS 13.3 or newer, using Vulkan through the SDK's bundled MoltenVK. Builds in CI; first game run pending. See [the macOS build guide](mac-build-guide.md).
 - **PS5**: not started. Plan is a platform layer for the runtime's POSIX files (16 files, about 3,700 lines) plus a Vulkan driver for PS5 homebrew. `generated/default/` and `src/` are shared with PC unchanged.
 
 ## Licence

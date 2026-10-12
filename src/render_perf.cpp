@@ -67,6 +67,8 @@ bool mcla_fence_spin() {
   } else {
 #if defined(_M_X64) || defined(__x86_64__)
     _mm_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("isb" ::: "memory");
 #endif
   }
   return true;

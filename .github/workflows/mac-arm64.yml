@@ -1,0 +1,281 @@
+# Native Apple Silicon build of the ReXGlue SDK (patched) plus an x86-64 Linux
+# regression guard. Host linking and launch use synthetic code in a temporary
+# copy. No game files, keys, or game-derived output enter CI or artifacts.
+name: mac-arm64
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "patches/**"
+      - "scripts/**"
+      - "src/**"
+      - "CMakeLists.txt"
+      - "CMakePresets.json"
+      - "generated/rexglue.cmake"
+      - ".github/workflows/mac-arm64.yml"
+
+concurrency:
+  group: mac-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SDK_TAG: v0.10.0
+  SDK_COMMIT: f5337cdc947ff6d4c4196737e2c807a48f2a1fc2
+
+jobs:
+  # Syntax and style check of the build scripts.
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n and shellcheck
+        run: |
+          shopt -s nullglob
+          files=(scripts/*.sh)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No scripts/*.sh yet; nothing to lint."
+            exit 0
+          fi
+          for f in "${files[@]}"; do
+            bash -n "$f"
+          done
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+          shellcheck -x -P scripts "${files[@]}"
+
+  # x86 regression guard: the patch must still build on Linux x86-64 and pass
+  # the PPC instruction tests exactly as before the macOS work.
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # clang 20 from apt.llvm.org, as in the SDK CI.
+      - name: Install clang 20
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wget gnupg lsb-release software-properties-common
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 20
+          sudo apt-get install -y clang-20 lld-20
+
+      # Linux build deps (SDK CI list for the 24.04 runner).
+      - name: Install build deps
+        run: |
+          sudo apt-get install -y cmake ninja-build build-essential git curl unzip zip autoconf python3-venv \
+            libgtk-3-dev libx11-xcb-dev libxss-dev libvulkan-dev \
+            libwayland-dev libwayland-bin wayland-protocols libxkbcommon-dev libdecor-0-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev
+
+      # Same clone location and patch invocations as the scripts.
+      - name: Clone SDK and apply patches
+        run: |
+          mkdir -p third_party
+          git clone --recursive --branch "$SDK_TAG" https://github.com/rexglue/rexglue-sdk.git third_party/rexglue-sdk
+          test "$(git -C third_party/rexglue-sdk rev-parse HEAD)" = "$SDK_COMMIT"
+          git -C third_party/rexglue-sdk apply ../../patches/rexglue-v0.10.0-mcla.patch
+          git -C third_party/rexglue-sdk/thirdparty/FFmpeg apply ../../../../patches/rexglue-ffmpeg-ps5-config.patch
+
+      - name: Set up sccache
+        uses: hendrikmuhs/ccache-action@v1.2.22
+        with:
+          variant: sccache
+          key: linux-x86_64-${{ hashFiles('patches/**') }}
+
+      - name: Configure
+        working-directory: third_party/rexglue-sdk
+        run: |
+          cmake --preset linux-amd64 \
+            -DREXGLUE_BUILD_TESTS=ON -DREXGLUE_ENABLE_TRACY=OFF \
+            -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20 \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+
+      - name: Build rexglue and ppc_tests (Release)
+        working-directory: third_party/rexglue-sdk
+        run: cmake --build out/build/linux-amd64 --config Release --target rexglue ppc_tests --parallel
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+      - name: Run PPC tests
+        working-directory: third_party/rexglue-sdk/out/build/linux-amd64
+        run: ctest -C Release -R '^ppc\.' --output-on-failure --output-junit "$GITHUB_WORKSPACE/linux-ppc-junit.xml"
+
+      # Stage only the binaries assembled from the SDK's own tests/ppc/asm
+      # sources (.bin and .map). A later macOS job can consume this artifact.
+      - name: Stage assembled PPC test binaries
+        if: always()
+        run: |
+          mkdir -p ppc-test-bins
+          cp third_party/rexglue-sdk/out/build/linux-amd64/tests/ppc/bin/*.bin ppc-test-bins/ || true
+          cp third_party/rexglue-sdk/out/build/linux-amd64/tests/ppc/bin/*.map ppc-test-bins/ || true
+
+      - name: Upload junit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-ppc-junit
+          path: linux-ppc-junit.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload assembled PPC test binaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppc-test-bins
+          path: |
+            ppc-test-bins/*.bin
+            ppc-test-bins/*.map
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Native Apple Silicon build via the project scripts.
+  mac-arm64:
+    # Needs the PPC test binaries the Linux job assembles (the SDK's patched
+    # PowerPC binutils only run on Linux and Windows).
+    needs: linux-x86_64
+    runs-on: macos-26
+    timeout-minutes: 150
+    env:
+      TESTS_DIR: third_party/rexglue-sdk/out/build/mac-arm64-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      # Refuse to run under Rosetta or on an Intel runner.
+      - name: Assert native arm64
+        run: |
+          test "$(uname -m)" = "arm64"
+          test "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" != "1"
+
+      # Already-installed formulae are fine.
+      - name: Install cmake and ninja
+        run: |
+          brew install cmake ninja || true
+          command -v cmake ninja
+
+      - name: Set up sccache
+        uses: hendrikmuhs/ccache-action@v1.2.22
+        with:
+          variant: sccache
+          key: mac-arm64-${{ hashFiles('patches/**') }}
+
+      # make_mac.sh clones the SDK, applies both patches, configures the
+      # mac-arm64 preset, builds and installs Release. CMake reads the
+      # launcher env vars, so sccache is picked up without script changes.
+      - name: Build and install SDK
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
+        run: scripts/make_mac.sh --sdk-only
+
+      # Install tree must be arm64-only, unsigned, and link only system/@rpath libs.
+      - name: Check arm64 install tree
+        run: |
+          set -o pipefail
+          mkdir -p out/logs
+          scripts/check_arm64.sh third_party/rexglue-sdk/out/install/mac-arm64 2>&1 | tee out/logs/arch-report.txt
+
+      - name: Link, package, sign and launch mcla (no game data)
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
+        run: |
+          set -o pipefail
+          host_dir="$(mktemp -d "$RUNNER_TEMP/mcla-link.XXXXXX")"
+          trap 'rm -rf "$host_dir"' EXIT
+          sdk="$GITHUB_WORKSPACE/third_party/rexglue-sdk"
+          install="$sdk/out/install/mac-arm64"
+          logs="$GITHUB_WORKSPACE/out/logs/host-smoke"
+          mkdir -p "$logs"
+          scripts/ci_link_stub.sh "$host_dir" "$sdk"
+          cd "$host_dir"
+          # Same preset and pins as build_mac.sh; only the codegen tool is synthetic.
+          cmake --preset mac-arm64-release \
+            -DCMAKE_PREFIX_PATH="$install" \
+            -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DMCLA_STRICT_FP=OFF -DCMAKE_PROJECT_mcla_INCLUDE="$host_dir/ci-codegen.cmake"
+          cmake --build --preset mac-arm64-release --parallel -- -k 0
+          build="$host_dir/out/build/mac-arm64-release"
+          test -x "$build/mcla"
+          # Match build_mac.sh's plugin copy; require the SDK's POST_BUILD staging.
+          plugin="$(find "$install/lib" -name librexgpu-xenos.dylib -print -quit)"
+          test -n "$plugin"
+          cp "$plugin" "$build/"
+          for rel in librexruntime.dylib librexgpu-xenos.dylib vulkan/lib/libvulkan.1.dylib \
+            vulkan/lib/libMoltenVK.dylib vulkan/share/vulkan/icd.d/MoltenVK_icd.json; do
+            test -f "$build/$rel" || { echo "Missing staged runtime: $rel"; exit 1; }
+          done
+          scripts/check_arm64.sh "$build" 2>&1 | tee "$logs/build-arch.txt"
+          scripts/make_app_mac.sh 2>&1 | tee "$logs/package.txt"
+          launch_status=0
+          scripts/ci_launch_smoke.sh bare "$build/mcla" "$logs" || launch_status=1
+          scripts/ci_launch_smoke.sh bundle "$host_dir/MCLA.app/Contents/MacOS/mcla" "$logs" || launch_status=1
+          # Verify even if a launch failed: no logs/settings may enter the signed app.
+          codesign --verify --strict --verbose=2 "$host_dir/MCLA.app" 2>&1 | tee "$logs/post-launch-signature.txt"
+          test "$launch_status" -eq 0
+          echo "PASS mcla: linked, arm64 checked, packaged, signed and launch smoke checked"
+
+      # Assembled from the SDK's own tests/ppc/asm sources; host-independent.
+      - name: Download assembled PPC test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: ppc-test-bins
+          path: ppc-test-bins
+
+      # Separate build dir (the script's build does not enable tests), same
+      # flags as the mac-arm64 preset.
+      - name: Configure tests
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
+        run: |
+          cmake -S third_party/rexglue-sdk -B "$TESTS_DIR" -G "Ninja Multi-Config" \
+            -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DCMAKE_C_FLAGS=-march=armv8-a -DCMAKE_CXX_FLAGS=-march=armv8-a \
+            -DCMAKE_CXX_STANDARD=23 \
+            -DCMAKE_CONFIGURATION_TYPES="Debug;Release;RelWithDebInfo" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DREXGLUE_BUILD_TESTS=ON -DREXGLUE_ENABLE_TRACY=OFF \
+            -DREXGLUE_PPC_PREBUILT_DIR="$GITHUB_WORKSPACE/ppc-test-bins"
+
+      - name: Build unit_tests
+        run: cmake --build "$TESTS_DIR" --config Release --target unit_tests --parallel -- -k 0
+
+      # Everything except fiber tests must pass.
+      - name: Unit tests (excluding fiber)
+        working-directory: third_party/rexglue-sdk/out/build/mac-arm64-tests
+        run: ctest -C Release -R '^unit\.' -E '[Ff]iber' --output-on-failure --output-junit "$GITHUB_WORKSPACE/out/logs/unit-junit.xml"
+
+      # Run on their own so a fiber failure is easy to spot in the log.
+      - name: Unit tests (fiber)
+        working-directory: third_party/rexglue-sdk/out/build/mac-arm64-tests
+        run: ctest -C Release -R '^unit\..*[Ff]iber' --output-on-failure --output-junit "$GITHUB_WORKSPACE/out/logs/unit-fiber-junit.xml"
+
+      # The PowerPC instruction tests, recompiled and run natively on arm64.
+      - name: Build ppc_tests
+        run: cmake --build "$TESTS_DIR" --config Release --target ppc_tests --parallel -- -k 0
+
+      - name: PPC tests
+        working-directory: third_party/rexglue-sdk/out/build/mac-arm64-tests
+        run: ctest -C Release -R '^ppc\.' --output-on-failure --output-junit "$GITHUB_WORKSPACE/out/logs/ppc-junit.xml"
+
+      - name: Upload logs and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-arm64-logs
+          path: |
+            out/logs/**
+            third_party/rexglue-sdk/out/logs/**
+          if-no-files-found: warn
+          retention-days: 14

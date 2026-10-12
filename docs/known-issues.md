@@ -2,6 +2,16 @@
 
 Updated 2026-10-03. PC (Windows, D3D12 and Vulkan). On PS5 only the memory probe has run; see `ps5-feasibility.md`.
 
+## macOS (Apple Silicon)
+
+Builds in CI; first game run pending. The patched SDK and its unit and PowerPC instruction tests pass on native arm64, but the game and `MCLA.app` still need a Mac build and play session. No macOS frame-rate or frame-pacing measurements are available. See the [macOS build guide](mac-build-guide.md).
+
+- **MoltenVK feature gaps.** Geometry shaders are unavailable, so the SDK uses vertex-shader expansion for point sprites and rectangle lists and converts quads to triangles. Cull distance is unavailable, and Metal always applies primitive restart. D24S8 depth falls back to D32F, and null descriptors are unavailable. Missing sprites, particles, HUD elements or depth artifacts remain risks until checked in gameplay.
+- **16 KiB host pages.** Guest memory uses smaller pages. The SDK handles the host mapping granularity, but write-watch callbacks that inspect only the first guest page within a host page may leave stale GPU data. This is a suspected rendering risk, not a reproduced game failure; the page-related performance options need measurements before changing defaults.
+- **Fibers.** The POSIX implementation uses deprecated `getcontext`/`makecontext`/`swapcontext` APIs. The fiber tests pass on arm64 in CI; that does not establish every game path's behavior. The game is not currently known to switch fibers.
+- **Guest SEH and hardware faults.** An unhandled hardware fault ends the process. Guest `SEH_TRY` around such faults is not a reliable recovery mechanism: the build lacks `-fnon-call-exceptions`, and throwing out of the signal path may terminate. Runtime-handled MMIO and write-watch faults still resume normally.
+- **Floating point.** Strict FP is off by default for the game pending correctness and performance measurement. FMA contraction is disabled on arm64, but that alone does not prevent optimization across guest rounding-mode changes. The SDK's PPC tests use strict FP, so passing them does not validate the game's non-strict build.
+
 ## Milestone reached
 
 **Boots to the title screen** on Windows/D3D12 (2026-10-03, run 20261003-103007): the Complete Edition logo over the live 3D city with traffic, "PRESS START" prompt, about 38 s after launch. The process was still running at 75 s with 77 threads and 1.36 GB working set, and the log had no errors other than the missing audio device.

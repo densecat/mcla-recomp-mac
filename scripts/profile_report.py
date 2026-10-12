@@ -4,21 +4,52 @@
 Usage: profile_report.py <profile.txt> [--bin DIR] [--symbolizer PATH] [--top N] [--threads N]
 
 Samples in recompiled game code are already named by guest function. Samples
-in DLLs are module+offset; they are resolved with llvm-symbolizer against the
-DLLs (and their PDBs) in --bin.
+in DLLs, dylibs or the mcla executable are module+offset; they are resolved
+with llvm-symbolizer against the binaries (and their debug symbols) in --bin.
 """
 import argparse
 import collections
 import os
+import struct
 import subprocess
+
+
+def macho_text_address(binary):
+    # llvm-symbolizer's --relative-address adds the image base for PE only.
+    # Our arm64-only Mach-O binaries need their unslid __TEXT address added.
+    try:
+        with open(binary, "rb") as f:
+            header = f.read(32)
+            if len(header) != 32 or header[:4] != b"\xcf\xfa\xed\xfe":
+                return None
+            commands, size = struct.unpack_from("<II", header, 16)
+            end = 32 + size
+            for _ in range(commands):
+                start = f.tell()
+                if start + 8 > end:
+                    break
+                cmd, length = struct.unpack("<II", f.read(8))
+                if length < 8 or start + length > end:
+                    break
+                if cmd == 0x19 and length >= 72:  # LC_SEGMENT_64
+                    name, address = struct.unpack("<16sQ", f.read(24))
+                    if name.rstrip(b"\0") == b"__TEXT":
+                        return address
+                f.seek(start + length)
+    except (OSError, struct.error):
+        pass
+    return None
 
 
 def symbolize(symbolizer, binary, offsets):
     if not (symbolizer and os.path.exists(binary)):
         return {}
-    text = "\n".join(hex(o) for o in offsets) + "\n"
+    base = macho_text_address(binary)
+    # Linkage names also allow the Mach-O symbol table to work without a dSYM.
+    functions = "linkage" if base is not None else "short"
+    text = "\n".join(hex((base or 0) + o) for o in offsets) + "\n"
     try:
-        out = subprocess.run([symbolizer, f"--obj={binary}", "--relative-address", "--functions=short",
+        out = subprocess.run([symbolizer, f"--obj={binary}", "--relative-address", f"--functions={functions}",
                               "--no-inlines", "--demangle"],
                              input=text, capture_output=True, text=True, timeout=600).stdout
     except (OSError, subprocess.TimeoutExpired):
@@ -34,7 +65,7 @@ def symbolize(symbolizer, binary, offsets):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("profile")
-    ap.add_argument("--bin", default=None)
+    ap.add_argument("--bin", default=None, help="Build directory, .app bundle or Contents/MacOS directory")
     ap.add_argument("--symbolizer", default=None)
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--threads", type=int, default=3)
@@ -57,7 +88,13 @@ def main():
     resolved = {}
     for mod, offsets in by_module.items():
         if args.bin:
-            names = symbolize(args.symbolizer, os.path.join(args.bin, mod), sorted(offsets))
+            binary = os.path.join(args.bin, mod)
+            for folder in ("", "vulkan/lib", "Contents/MacOS", "Contents/MacOS/vulkan/lib"):
+                candidate = os.path.join(args.bin, folder, mod)
+                if os.path.isfile(candidate):
+                    binary = candidate
+                    break
+            names = symbolize(args.symbolizer, binary, sorted(offsets))
             for off, name in names.items():
                 if name and name != "??":
                     resolved[(mod, off)] = name
@@ -71,9 +108,10 @@ def main():
 
     print(header)
     rounds = int(header.split("rounds=")[1].split()[0]) if "rounds=" in header else 0
-    # Waiting threads sit in ntdll; rank threads by samples outside it.
+    # Rank threads by samples outside the OS wait modules (also when unresolved).
     def busy(counter):
-        return sum(n for w, n in counter.items() if "ntdll.dll" not in w and "win32u.dll" not in w)
+        waits = ("ntdll.dll", "win32u.dll", "libsystem_kernel.dylib", "libsystem_pthread.dylib")
+        return sum(n for w, n in counter.items() if not any(mod in w for mod in waits))
 
     ranked = sorted(per_thread.items(), key=lambda kv: -busy(kv[1]))
     for tid, counter in ranked[:args.threads]:
