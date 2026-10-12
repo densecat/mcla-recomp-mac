@@ -128,6 +128,15 @@ else
     echo "already installed: $INSTALL"
 fi
 [ -x "$INSTALL/bin/rexglue" ] || fail "the SDK was not installed"
+# CMake 4 rewrites install rpaths in place, which leaves the linker's
+# ad-hoc signature invalid; arm64 dyld will not load such a file.
+for f in "$INSTALL"/bin/* "$INSTALL"/lib/*.dylib; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    file -b "$f" | grep -q '^Mach-O' || continue
+    codesign -v "$f" > /dev/null 2>&1 && continue
+    codesign --force -s - "$f" || fail "could not re-sign $f"
+    echo "re-signed after install: $f"
+done
 "$MAC_SCRIPTS/check_arm64.sh" "$INSTALL" || fail "the installed SDK failed the arm64 check"
 if [ "$SDK_ONLY" -eq 1 ]; then
     echo ""
