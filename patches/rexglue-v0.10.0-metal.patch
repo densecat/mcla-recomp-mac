@@ -223,10 +223,10 @@ index 0000000..62e6f74
 +#endif
 diff --git a/include/rex/graphics/metal/render_target_cache.h b/include/rex/graphics/metal/render_target_cache.h
 new file mode 100644
-index 0000000..e9f215b
+index 0000000..e4a6ea8
 --- /dev/null
 +++ b/include/rex/graphics/metal/render_target_cache.h
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,95 @@
 +#pragma once
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +#include <Metal/Metal.hpp>
@@ -285,15 +285,17 @@ index 0000000..e9f215b
 +  static MTL::PixelFormat TransferFormat(xenos::ColorRenderTargetFormat format);
 +  uint32_t Samples(xenos::MsaaSamples samples) const;
 +  MTL::RenderPipelineState* TransferPipeline(const Target& source, const Target& dest,
-+                                            bool host_depth, bool preview,
-+                                            bool host_depth_copy = false);
-+  bool TransferTo(Target& dest, const Transfer& transfer);
++                                            const Target* host_depth, bool preview);
++  bool TransferTo(Target& dest, const Transfer& transfer, MTL::RenderCommandEncoder*& encoder,
++                  const Transfer::Rectangle* cutout = nullptr);
 +  bool BeginPass();
 +  bool EnsureEdram();
 +  bool EnsureTransferDepthState();
-+  bool StoreHostDepth(Target& target, const Transfer& transfer);
++  bool StoreHostDepth(Target& target, const Transfer& transfer,
++                      const Transfer::Rectangle* cutout);
 +  bool DumpRenderTargets(const draw_util::ResolveInfo& info);
-+  bool ClearResolveTarget(Target& target, const Transfer::Rectangle& rectangle, uint64_t value);
++  bool ClearResolveTarget(Target& target, const Transfer::Rectangle& rectangle, uint64_t value,
++                          MTL::RenderCommandEncoder*& encoder);
 +  bool UnsupportedResolve(uint32_t reason);
 +  struct Compute {
 +    MTL::ComputePipelineState* pipeline = nullptr;
@@ -322,10 +324,10 @@ index 0000000..e9f215b
 +#endif
 diff --git a/include/rex/graphics/metal/resources.h b/include/rex/graphics/metal/resources.h
 new file mode 100644
-index 0000000..3f43626
+index 0000000..b30afe5
 --- /dev/null
 +++ b/include/rex/graphics/metal/resources.h
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,106 @@
 +#pragma once
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +
@@ -352,6 +354,9 @@ index 0000000..3f43626
 +  void Finish();
 +  bool AllocateConstants(size_t size, MTL::Buffer*& buffer, size_t& offset);
 +  uint64_t epoch() const { return epoch_; }
++  uint64_t frame() const { return frame_; }
++  bool trace_resolves() const;
++  void NextFrame() { ++frame_; }
 +  uint64_t completed_epoch() const { return event_ ? event_->signaledValue() : 0; }
 +  MTL::CommandBuffer* buffer() const { return buffer_; }
 +  MTL::RenderCommandEncoder* encoder = nullptr;  // Retained until EndEncoding.
@@ -371,6 +376,7 @@ index 0000000..3f43626
 +  MTL::Buffer* uniforms_ = nullptr;
 +  size_t uniform_offset_ = 0;
 +  uint64_t epoch_ = 1;
++  uint64_t frame_ = 1;
 +  bool failed_ = false;
 +  std::deque<Pending> pending_;
 +  std::vector<MTL::Buffer*> free_uniforms_;
@@ -430,7 +436,7 @@ index 0000000..3f43626
 +#endif
 diff --git a/include/rex/graphics/metal/texture_cache.h b/include/rex/graphics/metal/texture_cache.h
 new file mode 100644
-index 0000000..7bcbc26
+index 0000000..e421329
 --- /dev/null
 +++ b/include/rex/graphics/metal/texture_cache.h
 @@ -0,0 +1,77 @@
@@ -453,8 +459,8 @@ index 0000000..7bcbc26
 +  void ClearCache() override;
 +  void BeginFrame() override;
 +  void RequestTextures(uint32_t used_texture_mask) override;
-+  // Fetch 0 supplies layout; the swap packet supplies the physical base page.
-+  MTL::Texture* RequestSwapTexture(uint32_t frontbuffer_ptr, uint32_t& width,
++  // Fetch 0 supplies the entire swap descriptor, as in Vulkan.
++  MTL::Texture* RequestSwapTexture(uint32_t& width,
 +      uint32_t& height, xenos::TextureFormat& format);
 +  // No uploads here: RequestTextures must precede render-pass/constant allocation.
 +  MTL::Texture* GetTexture(const SpirvShader::TextureBinding& binding, bool& missing);
@@ -991,10 +997,10 @@ index 6978e3f..8015868 100644
          Vulkan::Headers
 diff --git a/src/graphics/metal/command_processor.cpp b/src/graphics/metal/command_processor.cpp
 new file mode 100644
-index 0000000..bad017f
+index 0000000..216312b
 --- /dev/null
 +++ b/src/graphics/metal/command_processor.cpp
-@@ -0,0 +1,674 @@
+@@ -0,0 +1,714 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2021-2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
@@ -1045,6 +1051,8 @@ index 0000000..bad017f
 +  bool debug_present_logged = false;
 +  MTL::RenderPipelineState* swap_pipeline = nullptr;
 +  bool swap_pipeline_attempted = false;
++  uint32_t trace_draws = 0;
++  uint64_t previous_draws = 0, previous_rejected = 0;
 +  string::StringBuffer disassembly;
 +
 +  State(MTL::Device* d, MTL::CommandQueue* queue, const RegisterFile& regs, memory::Memory& memory)
@@ -1294,7 +1302,7 @@ index 0000000..bad017f
 +    state_.reset();
 +    return false;
 +  }
-+  REXLOG_WARN("Metal M3: GPU texture loading; native BC={}; resolves and queries remain stubbed",
++  REXLOG_WARN("Metal: GPU texture loading and host-RT resolves; native BC={}; queries remain stubbed",
 +              provider->device()->supportsBCTextureCompression());
 +  return true;
 +}
@@ -1359,7 +1367,8 @@ index 0000000..bad017f
 +  ++draws_;
 +  auto fail = [&](const char* reason) {
 +    ++rejected_draws_;
-+    if (rejected_draws_ == 1 || !(rejected_draws_ & 255))
++    if (rejected_draws_ == 1 || !(rejected_draws_ & 255) ||
++        (state_ && state_->submission.trace_resolves() && state_->trace_draws++ < 16))
 +      REXLOG_ERROR("Metal draw rejected (total={}): {}", rejected_draws_, reason);
 +    return false;
 +  };
@@ -1571,6 +1580,13 @@ index 0000000..bad017f
 +  e->setStencilReferenceValues(front.stencilref, back.stencilref);
 +  e->setBlendColor(regs.Get<float>(XE_GPU_REG_RB_BLEND_RED), regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
 +                   regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE), regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA));
++  if (s.submission.trace_resolves() && s.trace_draws++ < 16)
++    REXLOG_INFO("Metal trace frame={} draw vertices={} mask={:04X} attachments={:02X} "
++                "viewport={},{}+{}x{} z=[{},{}] scissor={},{}+{}x{} depth={:08X} raster={:08X}",
++                s.submission.frame(), p.host_draw_vertex_count, color_mask, attachments,
++                viewport.xy_offset[0], viewport.xy_offset[1], viewport.xy_extent[0], viewport.xy_extent[1],
++                viewport.z_min, viewport.z_max, scissor.offset[0], scissor.offset[1],
++                scissor.extent[0], scissor.extent[1], effective_depth.value, raster.value);
 +  if (indices.first) {
 +    e->drawIndexedPrimitives(primitive, p.host_draw_vertex_count,
 +        p.host_index_format == xenos::IndexFormat::kInt16 ? MTL::IndexTypeUInt16 : MTL::IndexTypeUInt32,
@@ -1612,11 +1628,30 @@ index 0000000..bad017f
 +  bool debug = state_ && REXCVAR_GET(metal_debug_present_last_rt) && state_->targets.has_debug_target();
 +  bool submitted = false;
 +  if (state_) {
++    if (state_->submission.trace_resolves()) {
++      REXLOG_INFO("Metal trace frame={} swap packet={:08X} fetch0={:08X} requested={}x{} "
++                  "draw-attempts={} rejected={}",
++                  state_->submission.frame(), frontbuffer_ptr,
++                  uint32_t(register_file_->GetTextureFetch(0).base_address) << 12, width, height,
++                  draws_ - state_->previous_draws, rejected_draws_ - state_->previous_rejected);
++#if defined(REXGLUE_ENABLE_PERF_COUNTERS) && !REX_PLATFORM_PS5
++      // The base swap handler has already flipped these counters.
++      for (auto id : {perf::CounterId::kMetalDrawsEncoded, perf::CounterId::kMetalPlaceholderTextureDraws,
++                      perf::CounterId::kMetalMslCompileFailures, perf::CounterId::kMetalRtTransfersSkipped,
++                      perf::CounterId::kMetalResolves, perf::CounterId::kMetalResolvesUnsupported,
++                      perf::CounterId::kRenderPassesBegun, perf::CounterId::kPassEndBarrierUpload,
++                      perf::CounterId::kPassEndBarrierTexture, perf::CounterId::kPassEndRtChange,
++                      perf::CounterId::kPassEndTransfer, perf::CounterId::kPassEndResolve,
++                      perf::CounterId::kPassEndMemexport, perf::CounterId::kPassEndSwap,
++                      perf::CounterId::kPassEndOther})
++        REXLOG_INFO("Metal trace frame={} snapshot {}={}", state_->submission.frame(),
++                    perf::CounterName(id), perf::GetSnapshotCounter(id));
++#endif
++    }
 +    // Resolves and frontbuffer loads precede the presenter's gamma pass on
 +    // the same provider queue. Hazard uploads may split the guest submission.
 +    if (presenter && !debug)
-+      source = state_->textures.RequestSwapTexture(frontbuffer_ptr, source_width, source_height,
-+                                                   source_format);
++      source = state_->textures.RequestSwapTexture(source_width, source_height, source_format);
 +    submitted = state_->submission.Submit(perf::CounterId::kPassEndSwap);
 +    state_->primitives.EndFrame();
 +    if (REXCVAR_GET(clear_memory_page_state))
@@ -1657,7 +1692,18 @@ index 0000000..bad017f
 +  }
 +  if (refreshed) DumpFrameIfRequested(*presenter, swaps_);
 +  else if (presenter) presenter->RefreshGuestOutput(0, 0, 0, 0, {});
-+  if (state_) { state_->targets.BeginFrame(); state_->textures.BeginFrame(); }
++  if (state_) {
++    if (state_->submission.trace_resolves())
++      REXLOG_INFO("Metal trace frame={} present source={} size={}x{} format={} submitted={} refreshed={} debug={}",
++                  state_->submission.frame(), source != nullptr, width, height,
++                  uint32_t(source_format), submitted, refreshed, debug);
++    state_->targets.BeginFrame();
++    state_->textures.BeginFrame();
++    state_->trace_draws = 0;
++    state_->previous_draws = draws_;
++    state_->previous_rejected = rejected_draws_;
++    state_->submission.NextFrame();
++  }
 +  if (presenter && !refreshed && !swap_failure_logged_) {
 +    REXLOG_ERROR("Metal frontbuffer refresh failed: address={:08X}, size={}x{}",
 +                 frontbuffer_ptr, width, height);
@@ -2273,10 +2319,10 @@ index 0000000..12b86d5
 +#endif
 diff --git a/src/graphics/metal/render_target_cache.cpp b/src/graphics/metal/render_target_cache.cpp
 new file mode 100644
-index 0000000..d33e5c0
+index 0000000..0c3d9da
 --- /dev/null
 +++ b/src/graphics/metal/render_target_cache.cpp
-@@ -0,0 +1,804 @@
+@@ -0,0 +1,857 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
@@ -2343,6 +2389,13 @@ index 0000000..d33e5c0
 +  a->setTexture(texture);
 +  a->setLoadAction(fresh ? MTL::LoadActionClear : MTL::LoadActionLoad);
 +  a->setStoreAction(MTL::StoreActionStore);
++}
++void EndUtilityPass(MTL::RenderCommandEncoder*& encoder, bool resolve) {
++  if (!encoder) return;
++  encoder->endEncoding();
++  encoder = nullptr;
++  if (resolve) PERF_METAL_counter_add(kPassEndResolve, 1);
++  else PERF_METAL_counter_add(kPassEndTransfer, 1);
 +}
 +}
 +MetalRenderTargetCache::MetalRenderTargetCache(const RegisterFile& regs,
@@ -2476,25 +2529,20 @@ index 0000000..d33e5c0
 +  else if (bound_ != targets || width_ != width || height_ != height || samples_ != samples)
 +    submission_.EndEncoding(perf::CounterId::kPassEndRtChange);
 +  for (uint32_t i = 0; i < targets.size(); ++i) {
++    MTL::RenderCommandEncoder* transfer_encoder = nullptr;
 +    for (const auto& transfer : last_update_transfers()[i]) {
-+      if (!targets[i] || !TransferTo(*targets[i], transfer)) {
++      if (!targets[i] || !TransferTo(*targets[i], transfer, transfer_encoder)) {
 +        PERF_METAL_counter_add(kMetalRtTransfersSkipped, 1);
 +        auto* source = static_cast<Target*>(transfer.source);
 +        auto* host = static_cast<Target*>(transfer.host_depth_source);
 +        // Disjoint reasons; their counters sum to metal_rt_transfers_skipped.
 +        uint32_t mode = 0;
 +        if (!targets[i] || !source || !source->initialized) mode = 1;
-+        else if (targets[i]->key().is_depth != source->key().is_depth) mode = 2;
-+        else if (targets[i]->key().Is64bpp() != source->key().Is64bpp()) mode = 3;
-+        else if (targets[i]->key().msaa_samples != source->key().msaa_samples) mode = 4;
 +        else if (host && (!targets[i]->key().is_depth || !host->initialized ||
-+                 !host->key().is_depth || host->key().resource_format != targets[i]->key().resource_format ||
-+                 host->key().msaa_samples != targets[i]->key().msaa_samples)) mode = 5;
++                 !host->key().is_depth ||
++                 host->key().resource_format != targets[i]->key().resource_format)) mode = 5;
 +        switch (mode) {
 +          case 1: PERF_METAL_counter_add(kMetalRtSkipUninitialized, 1); break;
-+          case 2: PERF_METAL_counter_add(kMetalRtSkipColorDepth, 1); break;
-+          case 3: PERF_METAL_counter_add(kMetalRtSkipBpp, 1); break;
-+          case 4: PERF_METAL_counter_add(kMetalRtSkipSamples, 1); break;
 +          case 5: PERF_METAL_counter_add(kMetalRtSkipHostDepth, 1); break;
 +          default: PERF_METAL_counter_add(kMetalRtSkipBoundsOrFailure, 1); break;
 +        }
@@ -2509,6 +2557,7 @@ index 0000000..d33e5c0
 +        }
 +      }
 +    }
++    EndUtilityPass(transfer_encoder, false);
 +  }
 +  bound_ = targets;
 +  width_ = width; height_ = height; samples_ = samples;
@@ -2544,8 +2593,10 @@ index 0000000..d33e5c0
 +  return true;
 +}
 +MTL::RenderPipelineState* MetalRenderTargetCache::TransferPipeline(
-+    const Target& source, const Target& dest, bool host_depth, bool preview, bool host_depth_copy) {
++    const Target& source, const Target& dest, const Target* host, bool preview) {
 +  auto sk = source.key(), dk = dest.key();
++  bool host_depth = host != nullptr, host_depth_copy = host == &dest;
++  auto host_samples = host && !host_depth_copy ? host->key().msaa_samples : xenos::MsaaSamples::k1X;
 +  bool depth = dk.is_depth && !preview;
 +  bool source_uint = !sk.is_depth && TransferFormat(sk.GetColorFormat()) != MTL::PixelFormatInvalid;
 +  bool dest_uint = !dk.is_depth && TransferFormat(dk.GetColorFormat()) != MTL::PixelFormatInvalid;
@@ -2554,8 +2605,9 @@ index 0000000..d33e5c0
 +  uint32_t samples = uint32_t(source.texture->sampleCount());
 +  std::array<uint32_t, 6> key{sk.resource_format, dk.resource_format, samples,
 +      uint32_t(depth) | (uint32_t(host_depth) << 1) | (uint32_t(preview) << 2) |
-+          (uint32_t(host_depth_copy) << 3),
-+      uint32_t(format), uint32_t(sk.msaa_samples)};
++          (uint32_t(host_depth_copy) << 3) | (uint32_t(sk.is_depth) << 4),
++      uint32_t(format), uint32_t(sk.msaa_samples) | (uint32_t(dk.msaa_samples) << 2) |
++          (uint32_t(host_samples) << 4)};
 +  auto [it, inserted] = transfer_pipelines_.emplace(key, nullptr);
 +  if (!inserted) return it->second;
 +  std::string code = fmt::format(
@@ -2586,14 +2638,15 @@ index 0000000..d33e5c0
 +    HostRenderTargetTransferShaderOptions options;
 +    options.dest_msaa_samples = dk.msaa_samples;
 +    options.source_msaa_samples = sk.msaa_samples;
-+    options.host_depth_source_msaa_samples = host_depth_copy ? xenos::MsaaSamples::k1X
-+                                                          : dk.msaa_samples;
++    options.host_depth_source_msaa_samples = host_samples;
 +    options.dest_resource_format = dk.resource_format;
 +    options.source_resource_format = sk.resource_format;
-+    options.mode = !depth ? HostRenderTargetTransferMode::kColorToColor :
-+        !host_depth ? HostRenderTargetTransferMode::kDepthToDepth :
-+        host_depth_copy ? HostRenderTargetTransferMode::kDepthAndHostDepthCopyToDepth :
-+                          HostRenderTargetTransferMode::kDepthAndHostDepthToDepth;
++    using Mode = HostRenderTargetTransferMode;
++    if (!depth) options.mode = sk.is_depth ? Mode::kDepthToColor : Mode::kColorToColor;
++    else if (!host_depth) options.mode = sk.is_depth ? Mode::kDepthToDepth : Mode::kColorToDepth;
++    else if (host_depth_copy) options.mode = sk.is_depth
++        ? Mode::kDepthAndHostDepthCopyToDepth : Mode::kColorAndHostDepthCopyToDepth;
++    else options.mode = sk.is_depth ? Mode::kDepthAndHostDepthToDepth : Mode::kColorAndHostDepthToDepth;
 +    options.source_color_is_uint = source_uint;
 +    options.dest_color_is_uint = dest_uint;
 +    options.msaa_2x_attachments_supported = native_2x_;
@@ -2614,7 +2667,7 @@ index 0000000..d33e5c0
 +  auto desc = Adopt(MTL::RenderPipelineDescriptor::alloc()->init());
 +  desc->setVertexFunction(vertex.get());
 +  desc->setFragmentFunction(preview ? fragment.get() : converted.function);
-+  desc->setRasterSampleCount(preview ? 1 : samples);
++  desc->setRasterSampleCount(preview ? 1 : Samples(dk.msaa_samples));
 +  if (depth) {
 +    desc->setDepthAttachmentPixelFormat(format);
 +    desc->setStencilAttachmentPixelFormat(format);
@@ -2626,19 +2679,23 @@ index 0000000..d33e5c0
 +  else PERF_METAL_counter_add(kMetalPipelinesCreated, 1);
 +  return it->second;
 +}
-+bool MetalRenderTargetCache::TransferTo(Target& dest, const Transfer& transfer) {
++bool MetalRenderTargetCache::TransferTo(Target& dest, const Transfer& transfer,
++    MTL::RenderCommandEncoder*& encoder, const Transfer::Rectangle* cutout) {
 +  auto* source = static_cast<Target*>(transfer.source);
 +  auto* host = static_cast<Target*>(transfer.host_depth_source);
++  if (submission_.trace_resolves())
++    REXLOG_INFO("Metal trace frame={} transfer src={} dst={} host={} tiles=[{}, {}) cutout={}",
++                submission_.frame(), source ? source->key().GetDebugName() : "none",
++                dest.key().GetDebugName(), host ? host->key().GetDebugName() : "none",
++                transfer.start_tiles, transfer.end_tiles, cutout != nullptr);
 +  if (!source || !source->initialized) return false;
 +  auto dk = dest.key(), sk = source->key();
-+  // 32<->64bpp, color<->depth and sample-layout conversions remain counted stubs.
-+  if (dk.is_depth != sk.is_depth || dk.Is64bpp() != sk.Is64bpp() ||
-+      dk.msaa_samples != sk.msaa_samples) return false;
 +  if (host && (!dk.is_depth || !host->initialized || !host->key().is_depth ||
-+      host->key().GetDepthFormat() != dk.GetDepthFormat() ||
-+      host->key().msaa_samples != dk.msaa_samples)) return false;
-+  uint32_t tw = 80u >> (uint32_t(dk.Is64bpp()) + uint32_t(dk.msaa_samples >= xenos::MsaaSamples::k4X));
-+  uint32_t th = 16u >> uint32_t(dk.msaa_samples >= xenos::MsaaSamples::k2X);
++      host->key().GetDepthFormat() != dk.GetDepthFormat())) return false;
++  Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
++  uint32_t count = transfer.GetRectangles(dk.base_tiles, dk.GetPitchTiles(), dk.msaa_samples,
++                                          dk.Is64bpp(), rectangles, cutout);
++  if (!count) return true;
 +  // Validate every tile before encoding any writes. Pitch/base changes and EDRAM
 +  // wrapping use the same 11-bit addressing in the shader as the common cache.
 +  for (uint32_t tile = transfer.start_tiles; tile < transfer.end_tiles; ++tile) {
@@ -2647,33 +2704,41 @@ index 0000000..d33e5c0
 +      auto key = rt->key();
 +      uint32_t local = (tile - key.base_tiles) & (xenos::kEdramTileCount - 1);
 +      uint32_t pitch = key.GetPitchTiles();
-+      if ((local % pitch + 1) * tw > rt->texture->width() ||
++      uint32_t tw = 80u >> (uint32_t(key.Is64bpp()) +
++                            uint32_t(key.msaa_samples >= xenos::MsaaSamples::k4X));
++      uint32_t th = 16u >> uint32_t(key.msaa_samples >= xenos::MsaaSamples::k2X);
++      if (!pitch || (local % pitch + 1) * tw > rt->texture->width() ||
 +          (local / pitch + 1) * th > rt->texture->height()) return false;
 +    }
 +  }
 +  // Vulkan's host_depth_store_* preserves full precision when the old depth
 +  // owner is also the destination. The transfer shader reads that saved buffer.
 +  bool host_depth_copy = host == &dest;
-+  if (host_depth_copy && !StoreHostDepth(dest, transfer)) return false;
-+  auto* pipeline = TransferPipeline(*source, dest, host != nullptr, false, host_depth_copy);
-+  if (!pipeline || (dk.is_depth && !EnsureTransferDepthState())) return false;
-+  auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
-+  if (dk.is_depth) {
-+    Attachment(pass->depthAttachment(), dest.texture, !dest.initialized);
-+    pass->depthAttachment()->setClearDepth(1);
-+    Attachment(pass->stencilAttachment(), dest.texture, !dest.initialized);
-+    pass->stencilAttachment()->setClearStencil(0);
-+  } else {
-+    Attachment(pass->colorAttachments()->object(0), dest.transfer, !dest.initialized);
-+    pass->colorAttachments()->object(0)->setClearColor(MTL::ClearColor(0, 0, 0, 0));
++  if (host_depth_copy) {
++    EndUtilityPass(encoder, cutout != nullptr);
++    if (!StoreHostDepth(dest, transfer, cutout)) return false;
 +  }
-+  auto* encoder = submission_.buffer()->renderCommandEncoder(pass);
-+  if (!encoder) return false;
-+  PERF_METAL_counter_add(kRenderPassesBegun, 1);
++  auto* pipeline = TransferPipeline(*source, dest, host, false);
++  if (!pipeline || (dk.is_depth && !EnsureTransferDepthState())) return false;
++  if (!encoder) {
++    auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
++    if (dk.is_depth) {
++      Attachment(pass->depthAttachment(), dest.texture, !dest.initialized);
++      pass->depthAttachment()->setClearDepth(1);
++      Attachment(pass->stencilAttachment(), dest.texture, !dest.initialized);
++      pass->stencilAttachment()->setClearStencil(0);
++    } else {
++      Attachment(pass->colorAttachments()->object(0), dest.transfer, !dest.initialized);
++      pass->colorAttachments()->object(0)->setClearColor(MTL::ClearColor(0, 0, 0, 0));
++    }
++    encoder = submission_.buffer()->renderCommandEncoder(pass);
++    if (!encoder) return false;
++    PERF_METAL_counter_add(kRenderPassesBegun, 1);
++  }
 +  encoder->setRenderPipelineState(pipeline);
 +  if (dk.is_depth) encoder->setDepthStencilState(transfer_depth_state_);
-+  encoder->setFragmentTexture(dk.is_depth ? source->texture : source->transfer, 0);
-+  if (dk.is_depth) encoder->setFragmentTexture(source->stencil, 1);
++  encoder->setFragmentTexture(sk.is_depth ? source->texture : source->transfer, 0);
++  if (sk.is_depth) encoder->setFragmentTexture(source->stencil, 1);
 +  if (host_depth_copy) encoder->setFragmentBuffer(edram_, 0, 1);
 +  else if (host) encoder->setFragmentTexture(host->texture, 2);
 +  auto address = [&](const Target& src) {
@@ -2687,16 +2752,12 @@ index 0000000..d33e5c0
 +  encoder->setFragmentBytes(constants.data(), host ? 8 : 4, 0);
 +  encoder->setViewport(MTL::Viewport{0, 0, double(dest.texture->width()),
 +                                      double(dest.texture->height()), 0, 1});
-+  Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithoutCutout];
-+  uint32_t count = transfer.GetRectangles(dk.base_tiles, dk.GetPitchTiles(), dk.msaa_samples,
-+                                          dk.Is64bpp(), rectangles);
 +  for (uint32_t i = 0; i < count; ++i) {
 +    auto r = rectangles[i];
 +    encoder->setScissorRect(MTL::ScissorRect{r.x_pixels, r.y_pixels, r.width_pixels, r.height_pixels});
 +    encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
 +  }
-+  encoder->endEncoding();
-+  PERF_METAL_counter_add(kPassEndTransfer, 1);
++  // Reuse this destination pass for the remaining transfers and optional clear.
 +  dest.initialized = true;
 +  return true;
 +}
@@ -2714,7 +2775,7 @@ index 0000000..d33e5c0
 +}
 +bool MetalRenderTargetCache::DebugPresent(MTL::CommandBuffer* buffer, MTL::Texture* output) {
 +  if (!debug_target_ || !buffer || !output) return false;
-+  auto* pipeline = TransferPipeline(*debug_target_, *debug_target_, false, true);
++  auto* pipeline = TransferPipeline(*debug_target_, *debug_target_, nullptr, true);
 +  if (!pipeline) return false;
 +  auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
 +  auto* color = pass->colorAttachments()->object(0);
@@ -2811,6 +2872,11 @@ index 0000000..d33e5c0
 +    auto* target = static_cast<Target*>(rectangle.render_target);
 +    if (!target || !target->initialized) return false;
 +    auto key = target->key();
++    if (submission_.trace_resolves())
++      REXLOG_INFO("Metal trace frame={} dump owner={} host={}x{} samples={} dump-base={} "
++                  "row-tiles={} rows={} pitch-tiles={}",
++                  submission_.frame(), key.GetDebugName(), target->texture->width(),
++                  target->texture->height(), target->texture->sampleCount(), base, row_length, rows, pitch);
 +    uint32_t shader_key = 0x1000 | uint32_t(key.msaa_samples) |
 +        (uint32_t(key.resource_format) << 2) | (uint32_t(key.is_depth) << 6);
 +    auto cached = compute_.find(shader_key);
@@ -2857,7 +2923,8 @@ index 0000000..d33e5c0
 +  // Tracked resources order dump writes before the separate resolve encoder.
 +  return true;
 +}
-+bool MetalRenderTargetCache::StoreHostDepth(Target& target, const Transfer& transfer) {
++bool MetalRenderTargetCache::StoreHostDepth(Target& target, const Transfer& transfer,
++    const Transfer::Rectangle* cutout) {
 +  if (!EnsureEdram()) return false;
 +  auto key = target.key();
 +  const auto& code = kHostDepthStoreShaders[size_t(key.msaa_samples)];
@@ -2872,9 +2939,9 @@ index 0000000..d33e5c0
 +  HostDepthStoreConstants constants{};
 +  constants.render_target =
 +      GetHostDepthStoreRenderTargetConstant(key.pitch_tiles_at_32bpp, native_2x_);
-+  Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithoutCutout];
++  Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
 +  uint32_t count = transfer.GetRectangles(key.base_tiles, key.GetPitchTiles(),
-+                                          key.msaa_samples, false, rectangles);
++                                          key.msaa_samples, false, rectangles, cutout);
 +  for (uint32_t i = 0; i < count; ++i) {
 +    uint32_t groups_x, groups_y;
 +    GetHostDepthStoreRectangleInfo(rectangles[i], key.msaa_samples, constants.rectangle,
@@ -2888,11 +2955,16 @@ index 0000000..d33e5c0
 +}
 +
 +bool MetalRenderTargetCache::ClearResolveTarget(
-+    Target& target, const Transfer::Rectangle& rectangle, uint64_t value) {
++    Target& target, const Transfer::Rectangle& rectangle, uint64_t value,
++    MTL::RenderCommandEncoder*& encoder) {
 +  auto key = target.key();
 +  if (!rectangle.width_pixels || !rectangle.height_pixels) return true;
 +  if (uint64_t(rectangle.x_pixels) + rectangle.width_pixels > target.texture->width() ||
 +      uint64_t(rectangle.y_pixels) + rectangle.height_pixels > target.texture->height()) return false;
++  if (submission_.trace_resolves())
++    REXLOG_INFO("Metal trace frame={} clear target={} rect={},{}+{}x{} value={:016X} reuse-pass={}",
++                submission_.frame(), key.GetDebugName(), rectangle.x_pixels, rectangle.y_pixels,
++                rectangle.width_pixels, rectangle.height_pixels, value, encoder != nullptr);
 +  bool uint_color = !key.is_depth && TransferFormat(key.GetColorFormat()) != MTL::PixelFormatInvalid;
 +  std::array<uint32_t, 4> bits{};
 +  auto set_float = [&](uint32_t index, float component) {
@@ -2979,19 +3051,21 @@ index 0000000..d33e5c0
 +    else PERF_METAL_counter_add(kMetalPipelinesCreated, 1);
 +  }
 +  if (!it->second || (key.is_depth && !EnsureTransferDepthState())) return false;
-+  auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
-+  if (key.is_depth) {
-+    Attachment(pass->depthAttachment(), target.texture, !target.initialized);
-+    pass->depthAttachment()->setClearDepth(1);
-+    Attachment(pass->stencilAttachment(), target.texture, !target.initialized);
-+    pass->stencilAttachment()->setClearStencil(0);
-+  } else {
-+    Attachment(pass->colorAttachments()->object(0), target.transfer, !target.initialized);
-+    pass->colorAttachments()->object(0)->setClearColor(MTL::ClearColor(0, 0, 0, 0));
++  if (!encoder) {
++    auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
++    if (key.is_depth) {
++      Attachment(pass->depthAttachment(), target.texture, !target.initialized);
++      pass->depthAttachment()->setClearDepth(1);
++      Attachment(pass->stencilAttachment(), target.texture, !target.initialized);
++      pass->stencilAttachment()->setClearStencil(0);
++    } else {
++      Attachment(pass->colorAttachments()->object(0), target.transfer, !target.initialized);
++      pass->colorAttachments()->object(0)->setClearColor(MTL::ClearColor(0, 0, 0, 0));
++    }
++    encoder = submission_.buffer()->renderCommandEncoder(pass);
++    if (!encoder) return false;
++    PERF_METAL_counter_add(kRenderPassesBegun, 1);
 +  }
-+  auto* encoder = submission_.buffer()->renderCommandEncoder(pass);
-+  if (!encoder) return false;
-+  PERF_METAL_counter_add(kRenderPassesBegun, 1);
 +  encoder->setRenderPipelineState(it->second);
 +  if (key.is_depth) encoder->setDepthStencilState(transfer_depth_state_);
 +  encoder->setFragmentBytes(bits.data(), sizeof(bits), 0);
@@ -3000,8 +3074,6 @@ index 0000000..d33e5c0
 +  encoder->setScissorRect(MTL::ScissorRect{rectangle.x_pixels, rectangle.y_pixels,
 +                                         rectangle.width_pixels, rectangle.height_pixels});
 +  encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
-+  encoder->endEncoding();
-+  PERF_METAL_counter_add(kPassEndResolve, 1);
 +  target.initialized = true;
 +  return true;
 +}
@@ -3025,7 +3097,25 @@ index 0000000..d33e5c0
 +  if (!draw_util::GetResolveInfo(register_file(), memory, 1, 1,
 +                                 fixed16_truncated, fixed16_truncated, info))
 +    return UnsupportedResolve(3);
++  if (submission_.trace_resolves()) {
++    const auto source = info.IsCopyingDepth() ? info.depth_edram_info : info.color_edram_info;
++    REXLOG_INFO("Metal trace frame={} resolve depth={} src-base={} pitch-tiles={} format={} msaa={} "
++                "size={}x{} dst={:08X} range={:08X}+{} dst-pitch={} dst-height={} "
++                "dst-format={} endian={} swap-rb={} tiled=1 array={} sample={} "
++                "dst-info={:08X} coords={:08X} clear-color={} clear-depth={} epoch={}",
++                submission_.frame(), info.IsCopyingDepth(), uint32_t(source.base_tiles),
++                uint32_t(source.pitch_tiles), uint32_t(source.format), uint32_t(source.msaa_samples),
++                uint32_t(info.coordinate_info.width_div_8) << 3, info.height_div_8 << 3,
++                info.copy_dest_base, info.copy_dest_extent_start, info.copy_dest_extent_length,
++                uint32_t(info.copy_dest_coordinate_info.pitch_aligned_div_32) << 5,
++                uint32_t(info.copy_dest_coordinate_info.height_aligned_div_32) << 5,
++                uint32_t(info.copy_dest_info.copy_dest_format), uint32_t(info.copy_dest_info.copy_dest_endian),
++                uint32_t(info.copy_dest_info.copy_dest_swap), uint32_t(info.copy_dest_info.copy_dest_array),
++                uint32_t(info.copy_dest_coordinate_info.copy_sample_select), info.copy_dest_info.value, info.copy_dest_coordinate_info.packed,
++                info.IsClearingColor(), info.IsClearingDepth(), submission_.epoch());
++  }
 +  if (!info.coordinate_info.width_div_8 || !info.height_div_8) return true;
++  if (!info.copy_dest_extent_length && !info.IsClearingDepth() && !info.IsClearingColor()) return true;
 +  if (!submission_.Begin()) return UnsupportedResolve(7);
 +  submission_.EndEncoding(perf::CounterId::kPassEndResolve);
 +  if (info.copy_dest_extent_length) {
@@ -3054,6 +3144,10 @@ index 0000000..d33e5c0
 +    encoder->endEncoding();
 +    shared.MarkGpuWrittenRange(info.copy_dest_extent_start, info.copy_dest_extent_length);
 +    textures.MarkRangeAsResolved(info.copy_dest_extent_start, info.copy_dest_extent_length);
++    if (submission_.trace_resolves())
++      REXLOG_INFO("Metal trace frame={} resolved+invalidated range={:08X}+{} shader={} epoch={}",
++                  submission_.frame(), info.copy_dest_extent_start, info.copy_dest_extent_length,
++                  uint32_t(shader), submission_.epoch());
 +    written_address = info.copy_dest_extent_start;
 +    written_length = info.copy_dest_extent_length;
 +  }
@@ -3071,9 +3165,14 @@ index 0000000..d33e5c0
 +    for (uint32_t i = 0; i < 2; ++i) {
 +      if (!targets[i]) continue;
 +      auto& target = *static_cast<Target*>(targets[i]);
-+      for (const auto& transfer : transfers[i])
-+        if (!TransferTo(target, transfer)) return UnsupportedResolve(6);
-+      if (!ClearResolveTarget(target, rectangle, values[i])) return UnsupportedResolve(6);
++      MTL::RenderCommandEncoder* encoder = nullptr;
++      bool success = true;
++      for (const auto& transfer : transfers[i]) {
++        if (!TransferTo(target, transfer, encoder, &rectangle)) { success = false; break; }
++      }
++      if (success) success = ClearResolveTarget(target, rectangle, values[i], encoder);
++      EndUtilityPass(encoder, true);
++      if (!success) return UnsupportedResolve(6);
 +    }
 +  }
 +  return true;
@@ -3268,10 +3367,10 @@ index 0000000..224274c
 +}  // namespace rex::graphics::metal
 diff --git a/src/graphics/metal/resources.cpp b/src/graphics/metal/resources.cpp
 new file mode 100644
-index 0000000..18416c9
+index 0000000..b683ce1
 --- /dev/null
 +++ b/src/graphics/metal/resources.cpp
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,315 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2021-2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
@@ -3284,8 +3383,14 @@ index 0000000..18416c9
 +#include <cstring>
 +#include <mutex>
 +#include <rex/logging.h>
++#include <rex/graphics/flags.h>
 +#include <rex/perf/counter.h>
 +#include "../../ui/metal/metal_util.h"
++
++REXCVAR_DEFINE_UINT64(metal_trace_resolves, 0, "GPU",
++                     "Trace resolves, transfers, texture reloads and swaps for N frames; 0 disables");
++REXCVAR_DEFINE_UINT64(metal_trace_resolves_start, 1, "GPU",
++                     "First swap number to trace (1-based)");
 +
 +namespace rex::graphics::metal {
 +using ui::metal::Adopt;
@@ -3299,6 +3404,10 @@ index 0000000..18416c9
 +  for (auto* buffer : free_uniforms_) buffer->release();
 +  ReleaseObject(listener_);
 +  ReleaseObject(event_);
++}
++bool MetalSubmission::trace_resolves() const {
++  uint64_t start = std::max(uint64_t(1), REXCVAR_GET(metal_trace_resolves_start));
++  return frame_ >= start && frame_ - start < REXCVAR_GET(metal_trace_resolves);
 +}
 +bool MetalSubmission::Initialize() {
 +  event_ = device_->newSharedEvent();
@@ -3579,10 +3688,10 @@ index 0000000..18416c9
 +#endif
 diff --git a/src/graphics/metal/texture_cache.cpp b/src/graphics/metal/texture_cache.cpp
 new file mode 100644
-index 0000000..c1de608
+index 0000000..e9acede
 --- /dev/null
 +++ b/src/graphics/metal/texture_cache.cpp
-@@ -0,0 +1,699 @@
+@@ -0,0 +1,706 @@
 +// Adapted from ReXGlue's Vulkan texture cache; Xenia, BSD (see LICENSE).
 +// Copyright 2022 Ben Vanik. All rights reserved.
 +#include <rex/graphics/metal/texture_cache.h>
@@ -3698,7 +3807,7 @@ index 0000000..c1de608
 +  }
 +  return false;
 +}
-+MTL::Texture* MetalTextureCache::RequestSwapTexture(uint32_t frontbuffer_ptr,
++MTL::Texture* MetalTextureCache::RequestSwapTexture(
 +    uint32_t& width, uint32_t& height, xenos::TextureFormat& format) {
 +  width = height = 0;
 +  format = xenos::TextureFormat::k_8_8_8_8;
@@ -3708,13 +3817,6 @@ index 0000000..c1de608
 +    UnsupportedResolveTexture(0); return nullptr;
 +  }
 +  auto fetch = register_file().GetTextureFetch(0);
-+  if (frontbuffer_ptr) {
-+    uint32_t physical = frontbuffer_ptr & (SharedMemory::kBufferSize - 1);
-+    if (physical & (xenos::kTextureSubresourceAlignmentBytes - 1)) {
-+      UnsupportedResolveTexture(1); return nullptr;
-+    }
-+    fetch.base_address = physical >> xenos::kTextureSubresourceAlignmentBytesLog2;
-+  }
 +  TextureKey key;
 +  BindingInfoFromFetchConstant(fetch, key, nullptr);
 +  if (!key.is_valid || !key.base_page || key.dimension != xenos::DataDimension::k2DOrStacked) {
@@ -3733,6 +3835,13 @@ index 0000000..c1de608
 +  if (!texture) return nullptr;
 +  key = texture->key();
 +  if (key.scaled_resolve) { UnsupportedResolveTexture(0); return nullptr; }
++  if (submission_.trace_resolves())
++    REXLOG_INFO("Metal trace frame={} swap-fetch base={:08X} size={}x{} pitch={} "
++                "format={} tiled={} endian={} swizzle={:03X} outdated={} epoch={}",
++                submission_.frame(), uint32_t(key.base_page) << 12, key.GetWidth(), key.GetHeight(),
++                uint32_t(fetch.pitch) << 5, uint32_t(key.format), uint32_t(key.tiled),
++                uint32_t(key.endianness), uint32_t(fetch.swizzle), uint32_t(texture->outdated_mask()),
++                submission_.epoch());
 +  if (!LoadTextureData(*texture)) return nullptr;
 +  SyncSubmission();
 +  texture->MarkAsUsed();
@@ -3946,6 +4055,13 @@ index 0000000..c1de608
 +                offsetof(LoadConstants, host_pitch) == 32 && offsetof(LoadConstants, height_texels) == 36);
 +  auto& texture = static_cast<MetalTexture&>(base);
 +  const auto key = texture.key();
++  if (submission_.trace_resolves())
++    REXLOG_INFO("Metal trace frame={} texture-load base={:08X}+{} mips={:08X}+{} "
++                "load={}/{} format={} tiled={} endian={} epoch={}",
++                submission_.frame(), uint32_t(key.base_page) << 12, texture.GetGuestBaseSize(),
++                uint32_t(key.mip_page) << 12, texture.GetGuestMipsSize(), load_base, load_mips,
++                uint32_t(key.format), uint32_t(key.tiled), uint32_t(key.endianness),
++                submission_.epoch());
 +  if (key.scaled_resolve) return UnsupportedResolveTexture(0);
 +  const auto format = GetFormat(key, key.signed_separate);
 +  auto* pipeline = GetLoader(format.load);
