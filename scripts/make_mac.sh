@@ -136,9 +136,9 @@ fi
 # verifies (an older install, or another install_name_tool) would not load
 # on arm64, so re-sign any such file.
 for f in "$INSTALL"/bin/* "$INSTALL"/lib/*.dylib; do
-    [ -f "$f" ] && [ ! -L "$f" ] || continue
-    file -b "$f" | grep -q '^Mach-O' || continue
-    codesign -v "$f" > /dev/null 2>&1 && continue
+    if [ ! -f "$f" ] || [ -L "$f" ]; then continue; fi
+    if ! file -b "$f" | grep -q '^Mach-O'; then continue; fi
+    if codesign -v "$f" > /dev/null 2>&1; then continue; fi
     codesign --force -s - "$f" || fail "could not re-sign $f"
     echo "re-signed after install: $f"
 done
