@@ -328,10 +328,10 @@ index 0000000..d79c9e3
 +#endif
 diff --git a/include/rex/graphics/metal/resources.h b/include/rex/graphics/metal/resources.h
 new file mode 100644
-index 0000000..9fcada3
+index 0000000..312152e
 --- /dev/null
 +++ b/include/rex/graphics/metal/resources.h
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,118 @@
 +#pragma once
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +
@@ -350,6 +350,7 @@ index 0000000..9fcada3
 +  MetalSubmission(MTL::Device* device, MTL::CommandQueue* queue);
 +  ~MetalSubmission();
 +  bool Initialize();
++  bool BeginFrame();
 +  bool Begin();
 +  bool Submit(perf::CounterId reason = perf::CounterId::kPassEndOther);
 +  bool Poll();
@@ -365,7 +366,7 @@ index 0000000..9fcada3
 +  uint64_t epoch() const { return epoch_; }
 +  uint64_t frame() const { return frame_; }
 +  bool trace_resolves() const;
-+  void NextFrame() { ++frame_; }
++  void NextFrame();
 +  uint64_t completed_epoch() const { return event_ ? event_->signaledValue() : 0; }
 +  MTL::CommandBuffer* buffer() const { return buffer_; }
 +  MTL::RenderCommandEncoder* encoder = nullptr;  // Retained until EndEncoding.
@@ -390,6 +391,9 @@ index 0000000..9fcada3
 +  uint64_t epoch_ = 1;
 +  uint64_t frame_ = 1;
 +  bool failed_ = false;
++  // Queue-tail markers include swap/paint work, not only guest submissions.
++  bool frame_started_ = false;
++  std::deque<MTL::CommandBuffer*> frames_;
 +  std::deque<Pending> pending_;
 +  std::vector<MTL::Buffer*> free_uniforms_;
 +};
@@ -448,10 +452,10 @@ index 0000000..9fcada3
 +#endif
 diff --git a/include/rex/graphics/metal/texture_cache.h b/include/rex/graphics/metal/texture_cache.h
 new file mode 100644
-index 0000000..17245f8
+index 0000000..663eb42
 --- /dev/null
 +++ b/include/rex/graphics/metal/texture_cache.h
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,93 @@
 +// Copyright 2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
 +#pragma once
@@ -479,6 +483,8 @@ index 0000000..17245f8
 +  MTL::SamplerState* GetSampler(const SpirvShader::SamplerBinding& binding);
 +
 + protected:
++  void BeginPreparedTextureLoadBatch(size_t count) override;
++  void EndPreparedTextureLoadBatch() override;
 +  void UpdateTextureBindingsImpl(uint32_t mask) override { prepared_mask_ &= ~mask; }
 +  bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
 +  uint32_t GetHostFormatSwizzle(TextureKey key) const override;
@@ -514,6 +520,17 @@ index 0000000..17245f8
 +  bool PrepareSlice(MetalTexture& texture);
 +  void SyncSubmission();
 +  bool GrowBuffer(MTL::Buffer*& buffer, size_t size);
++  bool FlushTextureLoads();
++  struct PendingBlit {
++    MTL::Buffer* source;  // Retained until FlushTextureLoads, then by the encoder.
++    MTL::Texture* target;
++    size_t offset, pitch, image_pitch;
++    uint32_t width, height, depth, layer, level;
++  };
++  std::vector<PendingBlit> pending_blits_;
++  MTL::ComputeCommandEncoder* load_encoder_ = nullptr;
++  bool batch_loading_ = false, batch_failed_ = false;
++  size_t upload_offset_ = 0;
 +  MTL::Device* device_;
 +  MetalSubmission& submission_;
 +  MetalSharedMemory& shared_;
@@ -621,10 +638,24 @@ index 0000000..4a5c349
 +    const HostRenderTargetDumpShaderOptions& options);
 +}  // namespace rex::graphics
 diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
-index d26cd4f..3dcec9c 100644
+index d26cd4f..807884a 100644
 --- a/include/rex/graphics/pipeline/texture/cache.h
 +++ b/include/rex/graphics/pipeline/texture/cache.h
-@@ -539,6 +539,13 @@ class TextureCache {
+@@ -528,6 +528,13 @@ class TextureCache {
+   virtual bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
+                                                      bool load_mips) = 0;
+ 
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++  // Only the successful batched-residency path may defer load encoding. The
++  // per-texture fallback requests memory again and may submit between loads.
++  virtual void BeginPreparedTextureLoadBatch(size_t) {}
++  virtual void EndPreparedTextureLoadBatch() {}
++#endif
++
+   // Converts a texture fetch constant to a texture key, normalizing and
+   // validating the values, or creating an invalid key, and also gets the
+   // post-guest-swizzle signedness.
+@@ -539,6 +546,13 @@ class TextureCache {
    // there was an error.
    void ResetTextureBindings(bool from_destructor = false);
  
@@ -717,10 +748,10 @@ index 34f7033..bed2651 100644
    enum class TransferOutput {
      kColor,
 diff --git a/include/rex/perf/counter.h b/include/rex/perf/counter.h
-index 829046d..d23d50c 100644
+index 829046d..7eb7732 100644
 --- a/include/rex/perf/counter.h
 +++ b/include/rex/perf/counter.h
-@@ -75,6 +75,43 @@ enum class CounterId : uint16_t {
+@@ -75,6 +75,60 @@ enum class CounterId : uint16_t {
    kUploadPlannedOtherBytes,
    kUploadPlannedHotBytes,
  
@@ -759,12 +790,29 @@ index 829046d..d23d50c 100644
 +  kMetalTextureRequestFastPaths,
 +  kMetalRangeRequestFastPaths,
 +  kMetalStateCallsSkipped,
++  kMetalFrameThrottleWaits,
++  kMetalFrameThrottleWaitUs,
++  kMetalFrameMarkers,
++  kMetalPresentErrors,
++  kMetalGuestOutputsQueued,
++  kMetalPaintsQueued,
++  kMetalUniformBytes,
++  kMetalUniformBytesZeroed,
++  kMetalUniformBytesSaved,
++  kMetalRenderPassesReused,
++  kMetalTextureLoadBatches,
++  kMetalTextureBlitEncoders,
++  kMetalTextureBlitCopies,
++  kMetalTextureBatchFailures,
++  kMetalTextureBatchBytesAllocated,
++  kMetalTextureLoadsBatched,
++  kMetalTextureLoadsImmediate,
 +#endif
 +
    kCount  // sentinel -- must be last
  };
  
-@@ -219,3 +256,9 @@ class Profiler {
+@@ -219,3 +273,9 @@ class Profiler {
  #else
  #define PERF_VULKAN_counter_add(id, delta)
  #endif
@@ -829,10 +877,10 @@ index 0000000..641b7b5
 +#endif
 diff --git a/include/rex/ui/metal/presenter.h b/include/rex/ui/metal/presenter.h
 new file mode 100644
-index 0000000..1f2635b
+index 0000000..ea7f404
 --- /dev/null
 +++ b/include/rex/ui/metal/presenter.h
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,78 @@
 +#pragma once
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +
@@ -863,11 +911,12 @@ index 0000000..1f2635b
 +class MetalGuestOutputRefreshContext final : public Presenter::GuestOutputRefreshContext {
 + public:
 +  // Borrowed until the refresher returns. Write every pixel, end all encoders,
-+  // then call SubmitAndWait before returning true. Never commit directly.
-+  // M2 may blit a resolved BGRA8 texture into texture() using command_buffer().
++  // then call Submit before returning true. Never commit directly. Refresh and
++  // all consumers use the provider's ordered queue with tracked resources.
 +  MTL::Texture* texture() const { return texture_; }
 +  MTL::CommandBuffer* command_buffer() const { return command_buffer_; }
-+  bool SubmitAndWait();
++  bool Submit();
++  bool SubmitAndWait();  // Explicit synchronous readback/debug use only.
 +  bool Clear(double red, double green, double blue);
 +
 + private:
@@ -963,10 +1012,10 @@ index 3e873dc..29d4d66 100644
  if(REXGLUE_ENABLE_TRACY)
      target_link_libraries(rexcore PUBLIC
 diff --git a/src/core/perf/counter.cpp b/src/core/perf/counter.cpp
-index 3b0cfef..459c93d 100644
+index 3b0cfef..9dacc4a 100644
 --- a/src/core/perf/counter.cpp
 +++ b/src/core/perf/counter.cpp
-@@ -69,6 +69,40 @@ constexpr const char* kCounterNames[] = {
+@@ -69,6 +69,57 @@ constexpr const char* kCounterNames[] = {
      "upload_planned_explicit_bytes",
      "upload_planned_other_bytes",
      "upload_planned_hot_bytes",
@@ -1003,11 +1052,28 @@ index 3b0cfef..459c93d 100644
 +    "metal_texture_request_fast_paths",
 +    "metal_range_request_fast_paths",
 +    "metal_state_calls_skipped",
++    "metal_frame_throttle_waits",
++    "metal_frame_throttle_wait_us",
++    "metal_frame_markers",
++    "metal_present_errors",
++    "metal_guest_outputs_queued",
++    "metal_paints_queued",
++    "metal_uniform_bytes",
++    "metal_uniform_bytes_zeroed",
++    "metal_uniform_bytes_saved",
++    "metal_render_passes_reused",
++    "metal_texture_load_batches",
++    "metal_texture_blit_encoders",
++    "metal_texture_blit_copies",
++    "metal_texture_batch_failures",
++    "metal_texture_batch_bytes_allocated",
++    "metal_texture_loads_batched",
++    "metal_texture_loads_immediate",
 +#endif
  };
  static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
  
-@@ -112,6 +146,40 @@ constexpr bool kIsGauge[] = {
+@@ -112,6 +163,57 @@ constexpr bool kIsGauge[] = {
      false,  // kUploadPlannedExplicitBytes
      false,  // kUploadPlannedOtherBytes
      false,  // kUploadPlannedHotBytes
@@ -1044,6 +1110,23 @@ index 3b0cfef..459c93d 100644
 +    false,  // kMetalTextureRequestFastPaths
 +    false,  // kMetalRangeRequestFastPaths
 +    false,  // kMetalStateCallsSkipped
++    false,  // kMetalFrameThrottleWaits
++    false,  // kMetalFrameThrottleWaitUs
++    false,  // kMetalFrameMarkers
++    false,  // kMetalPresentErrors
++    false,  // kMetalGuestOutputsQueued
++    false,  // kMetalPaintsQueued
++    false,  // kMetalUniformBytes
++    false,  // kMetalUniformBytesZeroed
++    false,  // kMetalUniformBytesSaved
++    false,  // kMetalRenderPassesReused
++    false,  // kMetalTextureLoadBatches
++    false,  // kMetalTextureBlitEncoders
++    false,  // kMetalTextureBlitCopies
++    false,  // kMetalTextureBatchFailures
++    false,  // kMetalTextureBatchBytesAllocated
++    false,  // kMetalTextureLoadsBatched
++    false,  // kMetalTextureLoadsImmediate
 +#endif
  };
  static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
@@ -1094,10 +1177,10 @@ index 6978e3f..8015868 100644
          Vulkan::Headers
 diff --git a/src/graphics/metal/command_processor.cpp b/src/graphics/metal/command_processor.cpp
 new file mode 100644
-index 0000000..be8e18b
+index 0000000..6c56554
 --- /dev/null
 +++ b/src/graphics/metal/command_processor.cpp
-@@ -0,0 +1,730 @@
+@@ -0,0 +1,754 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2021-2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
@@ -1126,6 +1209,8 @@ index 0000000..be8e18b
 +#include <rex/ui/metal/provider.h>
 +#include "../../ui/metal/metal_util.h"
 +
++REXCVAR_DEFINE_BOOL(metal_compact_uniforms, true, "GPU",
++                    "Allocate and initialize only shader-visible Metal constants");
 +REXCVAR_DEFINE_BOOL(metal_cache_draw_state, true, "GPU",
 +                    "Skip unchanged pipeline, depth and shared-buffer bindings in a Metal pass");
 +REXCVAR_DEFINE_BOOL(metal_debug_present_last_rt, false, "GPU",
@@ -1281,7 +1366,7 @@ index 0000000..be8e18b
 +    encoder->endEncoding();
 +    PERF_METAL_counter_add(kPassEndSwap, 1);
 +    context.SetIs8bpc(true);  // Existing presenter mailbox is BGRA8.
-+    return context.SubmitAndWait();
++    return context.Submit();
 +  }
 +  bool BindTextures(const SpirvShader& shader, bool vertex) {
 +    auto* encoder = submission.encoder;
@@ -1591,9 +1676,18 @@ index 0000000..be8e18b
 +    indices = s.primitives.GetIndexBuffer(p);
 +  }
 +  constexpr size_t system_size = (sizeof(T::SystemConstants) + 255) & ~size_t(255);
-+  constexpr size_t offsets[] = {0, system_size, system_size + 4096,
-+                                system_size + 8192, system_size + 8192 + 256};
-+  constexpr size_t total = system_size + 8192 + 256 + 768;
++  const bool compact_uniforms = REXCVAR_GET(metal_compact_uniforms);
++  auto float_size = [compact_uniforms](const SpirvShader* shader) -> size_t {
++    if (!compact_uniforms) return 4096;
++    const size_t count = shader ? shader->constant_register_map().float_count : 0;
++    // Even an unused binding must have an in-bounds, aligned offset.
++    return (std::max(size_t(1), count) * 16 + 255) & ~size_t(255);
++  };
++  const size_t vertex_size = float_size(vs), pixel_size = float_size(ps);
++  const size_t offsets[] = {0, system_size, system_size + vertex_size,
++                            system_size + vertex_size + pixel_size,
++                            system_size + vertex_size + pixel_size + 256};
++  const size_t total = offsets[4] + 768;
 +  MTL::Buffer* uniforms;
 +  size_t base;
 +  if (!s.submission.AllocateConstants(total, uniforms, base)) return fail("uniform ring");
@@ -1626,7 +1720,17 @@ index 0000000..be8e18b
 +  auto* depth_state = s.pipelines.GetDepthState(regs, polygonal, effective_depth);
 +  if (!pipeline || !depth_state) return fail("pipeline state");
 +  auto* data = static_cast<uint8_t*>(uniforms->contents()) + base;
-+  std::memset(data, 0, total);
++  // FloatConstants writes every element of the translator's float_count array
++  // (all 256 for dynamic addressing). SystemConstants initializes all members;
++  // bool/loop and fetch blocks below are copied in full. Alignment padding and
++  // unused bindings are not shader-visible and need no per-draw clearing.
++  if (!compact_uniforms) {
++    std::memset(data, 0, total);
++    PERF_METAL_counter_add(kMetalUniformBytesZeroed, total);
++  }
++  PERF_METAL_counter_add(kMetalUniformBytes, total);
++  PERF_METAL_counter_add(kMetalUniformBytesSaved,
++      system_size + 8192 + 256 + 768 - total);
 +  auto system = SystemConstants(regs, p, viewport, polygonal, s.targets);
 +  for (uint32_t i = 0; i < 32; ++i) {
 +    if (!(texture_mask & (1u << i))) continue;
@@ -1741,6 +1845,9 @@ index 0000000..be8e18b
 +  bool debug = state_ && REXCVAR_GET(metal_debug_present_last_rt) && state_->targets.has_debug_target();
 +  bool submitted = false;
 +  if (state_) {
++    // Cached/empty swaps may never call Begin(); throttle them before queuing
++    // the presenter, just as frames containing draws are throttled at Begin().
++    if (!state_->submission.BeginFrame()) return;
 +    if (state_->submission.trace_resolves()) {
 +      REXLOG_INFO("Metal trace frame={} swap packet={:08X} fetch0={:08X} requested={}x{} "
 +                  "draw-attempts={} rejected={}",
@@ -1786,7 +1893,7 @@ index 0000000..be8e18b
 +          auto& metal = static_cast<ui::metal::MetalGuestOutputRefreshContext&>(context);
 +          if (debug) {
 +            if (!state_->targets.DebugPresent(metal.command_buffer(), metal.texture()) ||
-+                !metal.SubmitAndWait()) return false;
++                !metal.Submit()) return false;
 +            context.SetIs8bpc(true);
 +            if (!state_->debug_present_logged) {
 +              REXLOG_WARN("Metal: metal_debug_present_last_rt is displaying the debug color target");
@@ -2451,10 +2558,10 @@ index 0000000..a509a64
 +#endif
 diff --git a/src/graphics/metal/render_target_cache.cpp b/src/graphics/metal/render_target_cache.cpp
 new file mode 100644
-index 0000000..ce5211b
+index 0000000..9dc0456
 --- /dev/null
 +++ b/src/graphics/metal/render_target_cache.cpp
-@@ -0,0 +1,892 @@
+@@ -0,0 +1,895 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
@@ -2716,7 +2823,10 @@ index 0000000..ce5211b
 +  return BeginPass();
 +}
 +bool MetalRenderTargetCache::BeginPass() {
-+  if (submission_.encoder) return true;
++  if (submission_.encoder) {
++    PERF_METAL_counter_add(kMetalRenderPassesReused, 1);
++    return true;
++  }
 +  auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
 +  pass->setRenderTargetWidth(width_);
 +  pass->setRenderTargetHeight(height_);
@@ -3534,10 +3644,10 @@ index 0000000..224274c
 +}  // namespace rex::graphics::metal
 diff --git a/src/graphics/metal/resources.cpp b/src/graphics/metal/resources.cpp
 new file mode 100644
-index 0000000..c1d0f70
+index 0000000..90e293c
 --- /dev/null
 +++ b/src/graphics/metal/resources.cpp
-@@ -0,0 +1,387 @@
+@@ -0,0 +1,436 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2021-2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
@@ -3553,6 +3663,10 @@ index 0000000..c1d0f70
 +#include <rex/graphics/flags.h>
 +#include <rex/perf/counter.h>
 +#include "../../ui/metal/metal_util.h"
++
++REXCVAR_DEFINE_INT32(metal_max_frames_in_flight, 2, "GPU",
++                     "Maximum Metal guest frames, including the frame being encoded")
++    .range(1, 3);
 +
 +REXCVAR_DEFINE_BOOL(metal_staged_uploads, false, "GPU",
 +                    "Use ordered blits from fresh upload slices for in-flight shared-memory pages");
@@ -3605,10 +3719,39 @@ index 0000000..c1d0f70
 +    p.buffer->release();
 +    pending_.pop_front();
 +  }
++  while (!frames_.empty()) {
++    auto* frame = frames_.front();
++    if (frame->status() != MTL::CommandBufferStatusCompleted &&
++        frame->status() != MTL::CommandBufferStatusError) break;
++    if (frame->status() == MTL::CommandBufferStatusError) {
++      REXLOG_ERROR("Metal frame marker failed: {}", ErrorText(frame->error()));
++      failed_ = true;
++    }
++    frame->release();
++    frames_.pop_front();
++  }
 +  return !failed_;
 +}
-+bool MetalSubmission::Begin() {
++bool MetalSubmission::BeginFrame() {
 +  if (!Poll()) return false;
++  if (!frame_started_) {
++    const auto limit = size_t(std::clamp(REXCVAR_GET(metal_max_frames_in_flight), 1, 3));
++    while (frames_.size() >= limit) {
++      const auto start = std::chrono::steady_clock::now();
++      PERF_METAL_counter_add(kMetalFrameThrottleWaits, 1);
++      const bool ok = ui::metal::WaitForSubmission(frames_.front());
++      PERF_METAL_counter_add(kMetalFrameThrottleWaitUs,
++          std::chrono::duration_cast<std::chrono::microseconds>(
++              std::chrono::steady_clock::now() - start).count());
++      if (!ok) { failed_ = true; return false; }
++      if (!Poll()) return false;
++    }
++    frame_started_ = true;
++  }
++  return true;
++}
++bool MetalSubmission::Begin() {
++  if (!BeginFrame()) return false;
 +  if (!buffer_) {
 +    buffer_ = queue_->commandBuffer();
 +    if (!buffer_) return false;
@@ -3736,10 +3879,26 @@ index 0000000..c1d0f70
 +  encoder->retain();
 +  ++render_encoder_id_;  // Pointer equality alone cannot detect allocator address reuse.
 +}
++void MetalSubmission::NextFrame() {
++  // Called after RefreshGuestOutput (including immediate paint) and optional
++  // capture. All use queue_. A marker also bounds failed/occluded swaps.
++  auto pool = Adopt(NS::AutoreleasePool::alloc()->init());
++  if (!BeginFrame() || !Submit(perf::CounterId::kPassEndSwap)) return;
++  auto* marker = queue_->commandBuffer();
++  if (!marker) { failed_ = true; return; }
++  marker->retain();
++  frames_.push_back(marker);
++  marker->commit();
++  PERF_METAL_counter_add(kMetalFrameMarkers, 1);
++  ++frame_;
++  frame_started_ = false;
++  Poll();
++}
 +void MetalSubmission::Finish() {
-+  // Only teardown drains the queue; ordinary submission and cache clearing are async.
++  // Teardown drains all retained buffers, including the presenter's queue tail.
 +  Submit();
 +  for (const auto& p : pending_) p.buffer->waitUntilCompleted();
++  for (auto* frame : frames_) frame->waitUntilCompleted();
 +  Poll();
 +}
 +
@@ -3927,10 +4086,10 @@ index 0000000..c1d0f70
 +#endif
 diff --git a/src/graphics/metal/texture_cache.cpp b/src/graphics/metal/texture_cache.cpp
 new file mode 100644
-index 0000000..0a2815c
+index 0000000..69ba4af
 --- /dev/null
 +++ b/src/graphics/metal/texture_cache.cpp
-@@ -0,0 +1,726 @@
+@@ -0,0 +1,796 @@
 +// Adapted from ReXGlue's Vulkan texture cache; Xenia, BSD (see LICENSE).
 +// Copyright 2022 Ben Vanik. All rights reserved.
 +#include <rex/graphics/metal/texture_cache.h>
@@ -3941,6 +4100,8 @@ index 0000000..0a2815c
 +#include <rex/logging.h>
 +#include "../../ui/metal/metal_util.h"
 +
++REXCVAR_DEFINE_BOOL(metal_batch_texture_loads, false, "GPU",
++                    "Batch prepared texture computes and blits before the consuming draw");
 +REXCVAR_DEFINE_BOOL(metal_texture_request_fast_path, true, "GPU",
 +                    "Reuse clean texture requests within a submission, including prepared slices");
 +
@@ -4032,7 +4193,15 @@ index 0000000..0a2815c
 +    return;
 +  }
 +  prepared_mask_ &= ~mask;
++  batch_failed_ = false;
 +  TextureCache::RequestTextures(mask);
++  if (batch_failed_) {
++    // The base has tentatively marked loads valid. Discard those entries if
++    // their deferred copies could not be encoded; never sample stale texels.
++    ClearCache();
++    prepared_mask_ = 0;
++    return;
++  }
 +  SyncSubmission();  // A shared-memory upload may have split the submission.
 +  for (uint32_t i = 0; i < 32; ++i) {
 +    if (!(mask & (1u << i))) continue;
@@ -4053,6 +4222,44 @@ index 0000000..0a2815c
 +    }
 +    if (prepared) prepared_mask_ |= 1u << i;
 +  }
++}
++void MetalTextureCache::BeginPreparedTextureLoadBatch(size_t count) {
++  // All shared-memory snapshots are already resident; the commit traversal
++  // cannot perform another upload or submit the command buffer.
++  batch_loading_ = count > 1 && REXCVAR_GET(metal_batch_texture_loads);
++  upload_offset_ = 0;
++  if (batch_loading_) PERF_METAL_counter_add(kMetalTextureLoadBatches, 1);
++}
++void MetalTextureCache::EndPreparedTextureLoadBatch() {
++  batch_failed_ |= !FlushTextureLoads();
++  batch_loading_ = false;
++  upload_offset_ = 0;
++}
++bool MetalTextureCache::FlushTextureLoads() {
++  if (load_encoder_) {
++    load_encoder_->endEncoding();
++    load_encoder_ = nullptr;
++  }
++  if (pending_blits_.empty()) return true;
++  auto* blit = submission_.buffer()->blitCommandEncoder();
++  if (blit) {
++    PERF_METAL_counter_add(kMetalTextureBlitEncoders, 1);
++    for (const auto& copy : pending_blits_) {
++      blit->copyFromBuffer(copy.source, copy.offset, copy.pitch, copy.image_pitch,
++          MTL::Size(copy.width, copy.height, copy.depth), copy.target, copy.layer,
++          copy.level, MTL::Origin(0, 0, 0));
++      PERF_METAL_counter_add(kMetalTextureBlitCopies, 1);
++    }
++    blit->endEncoding();
++  } else {
++    PERF_METAL_counter_add(kMetalTextureBatchFailures, 1);
++  }
++  for (auto& copy : pending_blits_) {
++    ReleaseObject(copy.source);
++    ReleaseObject(copy.target);
++  }
++  pending_blits_.clear();
++  return blit != nullptr;
 +}
 +bool MetalTextureCache::UnsupportedResolveTexture(uint32_t reason) {
 +  PERF_METAL_counter_add(kMetalResolvesUnsupported, 1);
@@ -4446,12 +4653,30 @@ index 0000000..0a2815c
 +      upload_size += dst_image * d;
 +    }
 +  }
-+  if (!GrowBuffer(untiled_, size_t(untiled_size)) || !GrowBuffer(upload_, size_t(upload_size)) ||
-+      !submission_.Begin()) return false;
++  if (!GrowBuffer(untiled_, size_t(untiled_size)) || !submission_.Begin()) return false;
++  if (batch_loading_) {
++    // Every deferred destination slice stays immutable until its blit. Scratch
++    // untile storage may be reused: NextComputeEncoder inserts a buffer barrier.
++    if (!upload_ || upload_offset_ + upload_size > upload_->length()) {
++      const size_t size = std::max(size_t(4 * 1024 * 1024), size_t(upload_size));
++      auto* replacement = device_->newBuffer(size, MTL::ResourceStorageModePrivate);
++      if (!replacement) return false;
++      ReleaseObject(upload_);  // PendingBlit retains any earlier chunk.
++      upload_ = replacement;
++      upload_offset_ = 0;
++      PERF_METAL_counter_add(kMetalTextureBatchBytesAllocated, size);
++    }
++  } else {
++    upload_offset_ = 0;
++    if (!GrowBuffer(upload_, size_t(upload_size))) return false;
++  }
++  if (upload_offset_ + upload_size > UINT32_MAX) return false;
++  for (auto& copy : copies) copy.c[4] += uint32_t(upload_offset_);
++  upload_offset_ += size_t(upload_size);
 +  SyncSubmission();
 +  texture.MarkAsUsed();
 +  submission_.EndEncoding(perf::CounterId::kPassEndBarrierTexture);
-+  MTL::ComputeCommandEncoder* encoder = nullptr;
++  auto*& encoder = load_encoder_;
 +  if (!submission_.NextComputeEncoder(encoder)) return false;
 +  encoder->setComputePipelineState(pipeline);
 +  encoder->setBuffer(untiled_, 0, 1);
@@ -4487,14 +4712,18 @@ index 0000000..0a2815c
 +    encoder->dispatchThreadgroups(MTL::Size((copy.c[8] + 15) / 16, (copy.c[9] + 7) / 8,
 +                                            copy.depth), MTL::Size(16, 8, 1));
 +  }
-+  encoder->endEncoding();
-+  auto* blit = submission_.buffer()->blitCommandEncoder();
-+  if (!blit) return false;
-+  for (const auto& copy : copies)
-+    blit->copyFromBuffer(upload_, copy.c[4], copy.c[5], copy.c[6],
-+        MTL::Size(copy.width, copy.height, copy.depth), texture.image, copy.layer, copy.level,
-+        MTL::Origin(0, 0, 0));
-+  blit->endEncoding();
++  for (const auto& copy : copies) {
++    upload_->retain();
++    texture.image->retain();
++    pending_blits_.push_back({upload_, texture.image, copy.c[4], copy.c[5], copy.c[6],
++        copy.width, copy.height, copy.depth, copy.layer, copy.level});
++  }
++  if (batch_loading_) {
++    PERF_METAL_counter_add(kMetalTextureLoadsBatched, 1);
++  } else {
++    PERF_METAL_counter_add(kMetalTextureLoadsImmediate, 1);
++    if (!FlushTextureLoads()) return false;
++  }
 +  // All resources use Metal's tracked hazards, on the same queue as guest draws.
 +  texture.slice_dirty = true;
 +  PERF_METAL_counter_add(kMetalTextureLoads, 1);
@@ -4657,6 +4886,26 @@ index 0000000..0a2815c
 +}
 +}  // namespace rex::graphics::metal
 +#endif
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 210f77f..c02a5e2 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -579,9 +579,15 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+   }
+ 
+   if (batched_shared_memory_request_succeeded) {
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++    BeginPreparedTextureLoadBatch(pending_texture_loads.size());
++#endif
+     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
+       CommitPreparedTextureLoad(pending_load);
+     }
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++    EndPreparedTextureLoadBatch();
++#endif
+   } else {
+     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
+       if (pending_load.texture != nullptr) {
 diff --git a/src/graphics/plugin_main.cpp b/src/graphics/plugin_main.cpp
 index ec756d3..59d3fa5 100644
 --- a/src/graphics/plugin_main.cpp
@@ -5504,10 +5753,10 @@ index 0000000..8cccac8
 +#endif
 diff --git a/src/ui/metal/presenter.mm b/src/ui/metal/presenter.mm
 new file mode 100644
-index 0000000..e96a4c2
+index 0000000..c6ce438
 --- /dev/null
 +++ b/src/ui/metal/presenter.mm
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,285 @@
 +#include <rex/ui/metal/presenter.h>
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +
@@ -5517,11 +5766,15 @@ index 0000000..e96a4c2
 +#include <algorithm>
 +#include <utility>
 +#include <rex/cvar.h>
++#include <rex/perf/counter.h>
 +#include <rex/ui/flags.h>
 +#include <rex/ui/metal/immediate_drawer.h>
 +#include <rex/ui/metal/provider.h>
 +#include <rex/ui/surface_mac.h>
 +#include "metal_util.h"
++
++REXCVAR_DEFINE_BOOL(metal_async_presentation, true, "GPU",
++                    "Queue guest output and paint without waiting for GPU completion");
 +
 +namespace rex::ui::metal {
 +namespace {
@@ -5529,14 +5782,34 @@ index 0000000..e96a4c2
 +  // The cvar is defined in the GPU plugin; never link the runtime back to it.
 +  return !rex::cvar::GetFlagInfo("vsync") || REXCVAR_QUERY(bool, vsync);
 +}
++// No presenter/CP pointers: completion may run after their teardown.
++void ReportCompletion(MTL::CommandBuffer* buffer) {
++  buffer->addCompletedHandler(MTL::CommandBufferHandler([](MTL::CommandBuffer* completed) {
++    if (completed->status() == MTL::CommandBufferStatusError) {
++      PERF_METAL_counter_add(kMetalPresentErrors, 1);
++      REXLOG_ERROR("Metal presentation failed: {}", ErrorText(completed->error()));
++    }
++  }));
++}
++}
++
++bool MetalGuestOutputRefreshContext::Submit() {
++  if (!submitted_) {
++    submitted_ = true;
++    ReportCompletion(command_buffer_);
++    command_buffer_->commit();
++    PERF_METAL_counter_add(kMetalGuestOutputsQueued, 1);
++  }
++  if (!REXCVAR_GET(metal_async_presentation)) {
++    if (!completed_) completed_ = WaitForSubmission(command_buffer_);
++    return completed_;
++  }
++  return true;
 +}
 +
 +bool MetalGuestOutputRefreshContext::SubmitAndWait() {
-+  if (!submitted_) {
-+    submitted_ = true;
-+    command_buffer_->commit();
-+    completed_ = WaitForSubmission(command_buffer_);
-+  }
++  if (!Submit()) return false;
++  if (!completed_) completed_ = WaitForSubmission(command_buffer_);
 +  return completed_;
 +}
 +
@@ -5552,7 +5825,7 @@ index 0000000..e96a4c2
 +  if (!encoder) return false;
 +  encoder->endEncoding();
 +  SetIs8bpc(true);
-+  return SubmitAndWait();
++  return Submit();
 +}
 +
 +MetalPresenter::MetalPresenter(MetalProvider& provider, HostGpuLossCallback callback)
@@ -5643,8 +5916,12 @@ index 0000000..e96a4c2
 +  if (!buffer) return false;
 +  MetalGuestOutputRefreshContext context(is_8bpc_out, texture, buffer);
 +  bool refreshed = refresher(context);
-+  // Base Presenter publishes this slot immediately after we return true.
-+  return refreshed && context.submitted_ && context.completed_;
++  // Publish only after commit. Consumers commit on this same ordered queue
++  // before releasing mailbox ownership. Reuse is therefore ordered after every
++  // prior GPU read, even when completion has not reached the CPU yet. The
++  // display scans the drawable, never this guest texture; the three-slot base
++  // mailbox need not grow with queue depth.
++  return refreshed && context.submitted_;
 +}
 +
 +bool MetalPresenter::CaptureGuestOutput(RawImage& image_out) {
@@ -5734,14 +6011,18 @@ index 0000000..e96a4c2
 +    }
 +    encoder->endEncoding();
 +    if (!execute_ui_drawers) buffer->presentDrawable((__bridge MTL::Drawable*)drawable);
++    ReportCompletion(buffer);
 +    buffer->commit();
-+    bool completed = WaitForSubmission(buffer);
++    // Commit while owning the slot. A producer cannot reclaim it until a later
++    // consumer acquires another slot; that consumer must first take this lock.
 +    lock.unlock();
-+    if (!completed) return PaintResult::kNotPresented;
++    PERF_METAL_counter_add(kMetalPaintsQueued, 1);
++    if (!REXCVAR_GET(metal_async_presentation) && !WaitForSubmission(buffer))
++      return PaintResult::kNotPresented;
 +
 +    if (execute_ui_drawers) {
-+      // UI callbacks may themselves capture guest output. Never call them while
-+      // holding the mailbox lock. The guest sampling above has already completed.
++      // UI callbacks may capture guest output. Release the mailbox lock first;
++      // the guest sampling pass is already committed ahead of their work.
 +      buffer = provider_.queue()->commandBuffer();
 +      if (!buffer) return PaintResult::kNotPresented;
 +      color->setLoadAction(MTL::LoadActionLoad);
@@ -5751,8 +6032,10 @@ index 0000000..e96a4c2
 +      ExecuteUIDrawersFromUIThread(context);
 +      encoder->endEncoding();
 +      buffer->presentDrawable((__bridge MTL::Drawable*)drawable);
++      ReportCompletion(buffer);
 +      buffer->commit();
-+      if (!WaitForSubmission(buffer)) return PaintResult::kNotPresented;
++      if (!REXCVAR_GET(metal_async_presentation) && !WaitForSubmission(buffer))
++        return PaintResult::kNotPresented;
 +    }
 +    return PaintResult::kPresented;
 +  }
