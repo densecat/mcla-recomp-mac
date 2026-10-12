@@ -179,10 +179,10 @@ index 0000000..ecb6c18
 +#endif
 diff --git a/include/rex/graphics/metal/pipeline_cache.h b/include/rex/graphics/metal/pipeline_cache.h
 new file mode 100644
-index 0000000..62e6f74
+index 0000000..cf54a9c
 --- /dev/null
 +++ b/include/rex/graphics/metal/pipeline_cache.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,41 @@
 +#pragma once
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +#include <array>
@@ -216,6 +216,9 @@ index 0000000..62e6f74
 +  SpirvShaderTranslator translator_;
 +  std::array<std::unique_ptr<MetalFunction>, 2> depth_only_{};
 +  std::map<std::array<uint64_t, 4>, std::unique_ptr<MetalFunction>> shaders_;
++  // Non-owning: MetalCommandProcessor destroys this cache before its Shader objects.
++  // Include attachments: fragment MSL outputs depend on the active attachment mask.
++  std::map<std::array<uint64_t, 3>, MetalFunction*> shader_variants_;
 +  std::map<std::array<uint64_t, 18>, MTL::RenderPipelineState*> pipelines_;
 +  std::map<std::array<uint32_t, 3>, MTL::DepthStencilState*> depths_;
 +};
@@ -223,10 +226,10 @@ index 0000000..62e6f74
 +#endif
 diff --git a/include/rex/graphics/metal/render_target_cache.h b/include/rex/graphics/metal/render_target_cache.h
 new file mode 100644
-index 0000000..e4a6ea8
+index 0000000..d79c9e3
 --- /dev/null
 +++ b/include/rex/graphics/metal/render_target_cache.h
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,96 @@
 +#pragma once
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +#include <Metal/Metal.hpp>
@@ -293,7 +296,8 @@ index 0000000..e4a6ea8
 +  bool EnsureTransferDepthState();
 +  bool StoreHostDepth(Target& target, const Transfer& transfer,
 +                      const Transfer::Rectangle* cutout);
-+  bool DumpRenderTargets(const draw_util::ResolveInfo& info);
++  bool DumpRenderTargets(const draw_util::ResolveInfo& info,
++                         MTL::ComputeCommandEncoder*& encoder);
 +  bool ClearResolveTarget(Target& target, const Transfer::Rectangle& rectangle, uint64_t value,
 +                          MTL::RenderCommandEncoder*& encoder);
 +  bool UnsupportedResolve(uint32_t reason);
@@ -324,10 +328,10 @@ index 0000000..e4a6ea8
 +#endif
 diff --git a/include/rex/graphics/metal/resources.h b/include/rex/graphics/metal/resources.h
 new file mode 100644
-index 0000000..b30afe5
+index 0000000..9fcada3
 --- /dev/null
 +++ b/include/rex/graphics/metal/resources.h
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,114 @@
 +#pragma once
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +
@@ -353,6 +357,11 @@ index 0000000..b30afe5
 +  void EndEncoding(perf::CounterId reason = perf::CounterId::kPassEndOther);
 +  void Finish();
 +  bool AllocateConstants(size_t size, MTL::Buffer*& buffer, size_t& offset);
++  bool AllocateUpload(size_t size, MTL::Buffer*& buffer, size_t& offset);
++  // Reuse only adjacent buffer-based compute work; inserts a buffer memory barrier.
++  bool NextComputeEncoder(MTL::ComputeCommandEncoder*& encoder);
++  void SetRenderEncoder(MTL::RenderCommandEncoder* value);
++  uint64_t render_encoder_id() const { return render_encoder_id_; }
 +  uint64_t epoch() const { return epoch_; }
 +  uint64_t frame() const { return frame_; }
 +  bool trace_resolves() const;
@@ -375,6 +384,9 @@ index 0000000..b30afe5
 +  MTL::CommandBuffer* buffer_ = nullptr;
 +  MTL::Buffer* uniforms_ = nullptr;
 +  size_t uniform_offset_ = 0;
++  MTL::Buffer* uploads_ = nullptr;
++  size_t upload_offset_ = 0;
++  uint64_t render_encoder_id_ = 0;
 +  uint64_t epoch_ = 1;
 +  uint64_t frame_ = 1;
 +  bool failed_ = false;
@@ -436,10 +448,10 @@ index 0000000..b30afe5
 +#endif
 diff --git a/include/rex/graphics/metal/texture_cache.h b/include/rex/graphics/metal/texture_cache.h
 new file mode 100644
-index 0000000..e421329
+index 0000000..17245f8
 --- /dev/null
 +++ b/include/rex/graphics/metal/texture_cache.h
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,80 @@
 +// Copyright 2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
 +#pragma once
@@ -467,6 +479,7 @@ index 0000000..e421329
 +  MTL::SamplerState* GetSampler(const SpirvShader::SamplerBinding& binding);
 +
 + protected:
++  void UpdateTextureBindingsImpl(uint32_t mask) override { prepared_mask_ &= ~mask; }
 +  bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
 +  uint32_t GetHostFormatSwizzle(TextureKey key) const override;
 +  uint32_t GetMaxHostTextureWidthHeight(xenos::DataDimension dimension) const override;
@@ -486,6 +499,7 @@ index 0000000..e421329
 +    MTL::Texture* image;
 +    MTL::Texture* slice = nullptr;
 +    bool slice_dirty = true;
++    uint32_t loaded_mask = 0;
 +    std::map<uint64_t, MTL::Texture*> views;
 +    void AccountMemory();
 +  };
@@ -505,6 +519,7 @@ index 0000000..e421329
 +  MetalSharedMemory& shared_;
 +  const bool bc_, float32_filter_;
 +  uint64_t cache_epoch_ = 0;
++  uint32_t prepared_mask_ = 0;
 +  std::array<Loader, kLoadShaderCount> loaders_{};
 +  Loader repack_;
 +  MTL::Buffer* untiled_ = nullptr;
@@ -605,6 +620,39 @@ index 0000000..4a5c349
 +std::vector<uint32_t> BuildHostRenderTargetDumpSpirv(
 +    const HostRenderTargetDumpShaderOptions& options);
 +}  // namespace rex::graphics
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index d26cd4f..3dcec9c 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -539,6 +539,13 @@ class TextureCache {
+   // there was an error.
+   void ResetTextureBindings(bool from_destructor = false);
+ 
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++  bool TextureBindingsInSync(uint32_t mask) const {
++    return !(mask & ~texture_bindings_in_sync_) &&
++           !texture_became_outdated_.load(std::memory_order_acquire);
++  }
++#endif
++
+   const TextureBinding* GetValidTextureBinding(uint32_t fetch_constant_index) const {
+     const TextureBinding& binding = texture_bindings_[fetch_constant_index];
+     return binding.key.is_valid ? &binding : nullptr;
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index 370db1a..b381ba4 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -96,6 +96,10 @@ class SharedMemory {
+   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+ 
+  protected:
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++  // Opted into only by MetalSharedMemory; all other backends keep the existing path.
++  bool resident_range_fast_path_ = false;
++#endif
+   SharedMemory(memory::Memory& memory);
+   // Call in implementation-specific initialization.
+   void InitializeCommon();
 diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
 index 34f7033..bed2651 100644
 --- a/include/rex/graphics/vulkan/render_target_cache.h
@@ -669,10 +717,10 @@ index 34f7033..bed2651 100644
    enum class TransferOutput {
      kColor,
 diff --git a/include/rex/perf/counter.h b/include/rex/perf/counter.h
-index 829046d..6e88d63 100644
+index 829046d..d23d50c 100644
 --- a/include/rex/perf/counter.h
 +++ b/include/rex/perf/counter.h
-@@ -75,6 +75,26 @@ enum class CounterId : uint16_t {
+@@ -75,6 +75,43 @@ enum class CounterId : uint16_t {
    kUploadPlannedOtherBytes,
    kUploadPlannedHotBytes,
  
@@ -696,10 +744,27 @@ index 829046d..6e88d63 100644
 +  kMetalResolves,
 +  kMetalResolvesUnsupported,
 +
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++  kMetalShaderVariantHits,
++  kMetalShaderHashCalls,
++  kMetalUploadStagedBytes,
++  kMetalUploadStagingBytesAllocated,
++  kMetalUploadFallbacks,
++  kMetalTransferPassesMerged,
++  kMetalFullClearDiscards,
++  kMetalComputeEncoders,
++  kMetalComputeEncodersReused,
++  kMetalComputeDispatches,
++  kMetalTextureReloads,
++  kMetalTextureRequestFastPaths,
++  kMetalRangeRequestFastPaths,
++  kMetalStateCallsSkipped,
++#endif
++
    kCount  // sentinel -- must be last
  };
  
-@@ -219,3 +239,9 @@ class Profiler {
+@@ -219,3 +256,9 @@ class Profiler {
  #else
  #define PERF_VULKAN_counter_add(id, delta)
  #endif
@@ -898,10 +963,10 @@ index 3e873dc..29d4d66 100644
  if(REXGLUE_ENABLE_TRACY)
      target_link_libraries(rexcore PUBLIC
 diff --git a/src/core/perf/counter.cpp b/src/core/perf/counter.cpp
-index 3b0cfef..3455fda 100644
+index 3b0cfef..459c93d 100644
 --- a/src/core/perf/counter.cpp
 +++ b/src/core/perf/counter.cpp
-@@ -69,6 +69,24 @@ constexpr const char* kCounterNames[] = {
+@@ -69,6 +69,40 @@ constexpr const char* kCounterNames[] = {
      "upload_planned_explicit_bytes",
      "upload_planned_other_bytes",
      "upload_planned_hot_bytes",
@@ -923,10 +988,26 @@ index 3b0cfef..3455fda 100644
 +    "metal_rt_skip_bounds_or_failure",
 +    "metal_resolves",
 +    "metal_resolves_unsupported",
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++    "metal_shader_variant_hits",
++    "metal_shader_hash_calls",
++    "metal_upload_staged_bytes",
++    "metal_upload_staging_bytes_allocated",
++    "metal_upload_fallbacks",
++    "metal_transfer_passes_merged",
++    "metal_full_clear_discards",
++    "metal_compute_encoders",
++    "metal_compute_encoders_reused",
++    "metal_compute_dispatches",
++    "metal_texture_reloads",
++    "metal_texture_request_fast_paths",
++    "metal_range_request_fast_paths",
++    "metal_state_calls_skipped",
++#endif
  };
  static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
  
-@@ -112,6 +130,24 @@ constexpr bool kIsGauge[] = {
+@@ -112,6 +146,40 @@ constexpr bool kIsGauge[] = {
      false,  // kUploadPlannedExplicitBytes
      false,  // kUploadPlannedOtherBytes
      false,  // kUploadPlannedHotBytes
@@ -948,6 +1029,22 @@ index 3b0cfef..3455fda 100644
 +    false,  // kMetalRtSkipBoundsOrFailure
 +    false,  // kMetalResolves
 +    false,  // kMetalResolvesUnsupported
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++    false,  // kMetalShaderVariantHits
++    false,  // kMetalShaderHashCalls
++    false,  // kMetalUploadStagedBytes
++    false,  // kMetalUploadStagingBytesAllocated
++    false,  // kMetalUploadFallbacks
++    false,  // kMetalTransferPassesMerged
++    false,  // kMetalFullClearDiscards
++    false,  // kMetalComputeEncoders
++    false,  // kMetalComputeEncodersReused
++    false,  // kMetalComputeDispatches
++    false,  // kMetalTextureReloads
++    false,  // kMetalTextureRequestFastPaths
++    false,  // kMetalRangeRequestFastPaths
++    false,  // kMetalStateCallsSkipped
++#endif
  };
  static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
  
@@ -997,10 +1094,10 @@ index 6978e3f..8015868 100644
          Vulkan::Headers
 diff --git a/src/graphics/metal/command_processor.cpp b/src/graphics/metal/command_processor.cpp
 new file mode 100644
-index 0000000..216312b
+index 0000000..be8e18b
 --- /dev/null
 +++ b/src/graphics/metal/command_processor.cpp
-@@ -0,0 +1,714 @@
+@@ -0,0 +1,730 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2021-2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
@@ -1029,6 +1126,8 @@ index 0000000..216312b
 +#include <rex/ui/metal/provider.h>
 +#include "../../ui/metal/metal_util.h"
 +
++REXCVAR_DEFINE_BOOL(metal_cache_draw_state, true, "GPU",
++                    "Skip unchanged pipeline, depth and shared-buffer bindings in a Metal pass");
 +REXCVAR_DEFINE_BOOL(metal_debug_present_last_rt, false, "GPU",
 +                    "Debug only: display the largest guest color target instead of the frontbuffer");
 +
@@ -1054,6 +1153,9 @@ index 0000000..216312b
 +  uint32_t trace_draws = 0;
 +  uint64_t previous_draws = 0, previous_rejected = 0;
 +  string::StringBuffer disassembly;
++  uint64_t state_encoder_id = 0;
++  MTL::RenderPipelineState* bound_pipeline = nullptr;
++  MTL::DepthStencilState* bound_depth = nullptr;
 +
 +  State(MTL::Device* d, MTL::CommandQueue* queue, const RegisterFile& regs, memory::Memory& memory)
 +      : device(d), submission(d, queue), shared(memory, submission),
@@ -1537,10 +1639,21 @@ index 0000000..216312b
 +  std::memcpy(data + offsets[3], &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], 160);
 +  std::memcpy(data + offsets[4], &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 768);
 +  auto* e = s.submission.encoder;
-+  e->setRenderPipelineState(pipeline);
-+  e->setDepthStencilState(depth_state);
-+  e->setVertexBuffer(s.shared.buffer(), 0, 0);
-+  e->setFragmentBuffer(s.shared.buffer(), 0, 0);
++  const bool new_encoder = s.state_encoder_id != s.submission.render_encoder_id();
++  const bool cache_state = REXCVAR_GET(metal_cache_draw_state);
++  uint32_t skipped = 0;
++  if (!cache_state || new_encoder || s.bound_pipeline != pipeline) e->setRenderPipelineState(pipeline);
++  else ++skipped;
++  if (!cache_state || new_encoder || s.bound_depth != depth_state) e->setDepthStencilState(depth_state);
++  else ++skipped;
++  if (!cache_state || new_encoder) {
++    e->setVertexBuffer(s.shared.buffer(), 0, 0);
++    e->setFragmentBuffer(s.shared.buffer(), 0, 0);
++  } else skipped += 2;
++  s.state_encoder_id = s.submission.render_encoder_id();
++  s.bound_pipeline = pipeline;
++  s.bound_depth = depth_state;
++  PERF_METAL_counter_add(kMetalStateCallsSkipped, skipped);
 +  e->useResource(s.shared.buffer(), memexport ? MTL::ResourceUsageRead | MTL::ResourceUsageWrite
 +                                             : MTL::ResourceUsageRead,
 +                 MTL::RenderStageVertex | MTL::RenderStageFragment);
@@ -2064,10 +2177,10 @@ index 0000000..aa48e1e
 +#endif
 diff --git a/src/graphics/metal/pipeline_cache.cpp b/src/graphics/metal/pipeline_cache.cpp
 new file mode 100644
-index 0000000..12b86d5
+index 0000000..a509a64
 --- /dev/null
 +++ b/src/graphics/metal/pipeline_cache.cpp
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,268 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2021-2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
@@ -2080,6 +2193,9 @@ index 0000000..12b86d5
 +#include <rex/string/buffer.h>
 +#include <rex/perf/counter.h>
 +#include "../../ui/metal/metal_util.h"
++
++REXCVAR_DEFINE_BOOL(metal_shader_variant_cache, true, "GPU",
++                    "Cache Metal shader variants by Shader identity, modification and attachments");
 +
 +namespace rex::graphics::metal {
 +using ui::metal::Adopt;
@@ -2151,6 +2267,20 @@ index 0000000..12b86d5
 +}
 +MetalFunction* MetalPipelineCache::GetShader(SpirvShader& shader, uint64_t modification,
 +                                            uint32_t attachments) {
++  const bool cache_variant = REXCVAR_GET(metal_shader_variant_cache);
++  const std::array<uint64_t, 3> variant{uint64_t(reinterpret_cast<uintptr_t>(&shader)),
++                                        modification, attachments};
++  if (cache_variant) {
++    auto cached = shader_variants_.find(variant);
++    if (cached != shader_variants_.end()) {
++      PERF_METAL_counter_add(kMetalShaderVariantHits, 1);
++      return cached->second;
++    }
++  }
++  auto remember = [&](MetalFunction* function) {
++    if (cache_variant) shader_variants_.emplace(variant, function);
++    return function;
++  };
 +  auto* translation = shader.GetOrCreateTranslation(modification);
 +  if (!translation->is_translated() && !translator_.TranslateAnalyzedShader(*translation)) {
 +    PERF_METAL_counter_add(kMetalMslCompileFailures, 1);
@@ -2160,10 +2290,12 @@ index 0000000..12b86d5
 +  }
 +  if (!translation->is_valid()) return nullptr;
 +  const auto& binary = translation->translated_binary();
++  PERF_METAL_counter_add(kMetalShaderHashCalls, 1);
 +  uint64_t hash = XXH3_64bits(binary.data(), binary.size());
 +  std::array<uint64_t, 4> key{hash, modification, uint64_t(shader.type()), attachments};
 +  auto it = shaders_.find(key);
-+  if (it != shaders_.end()) return it->second->function ? it->second.get() : nullptr;
++  if (it != shaders_.end())
++    return remember(it->second->function ? it->second.get() : nullptr);
 +  auto value = std::make_unique<MetalFunction>();
 +  value->hash = hash;
 +  value->modification = modification;
@@ -2172,7 +2304,7 @@ index 0000000..12b86d5
 +                            uint32_t(shader.GetSamplerBindingsAfterTranslation().size()), *value, attachments);
 +  auto* result = value.get();
 +  shaders_.emplace(key, std::move(value));  // Cache failures; no endless recompilation.
-+  return success ? result : nullptr;
++  return remember(success ? result : nullptr);
 +}
 +MetalFunction* MetalPipelineCache::GetDepthOnlyShader() {
 +  using Mode = T::Modification::DepthStencilMode;
@@ -2319,10 +2451,10 @@ index 0000000..12b86d5
 +#endif
 diff --git a/src/graphics/metal/render_target_cache.cpp b/src/graphics/metal/render_target_cache.cpp
 new file mode 100644
-index 0000000..0c3d9da
+index 0000000..ce5211b
 --- /dev/null
 +++ b/src/graphics/metal/render_target_cache.cpp
-@@ -0,0 +1,857 @@
+@@ -0,0 +1,892 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
@@ -2339,6 +2471,11 @@ index 0000000..0c3d9da
 +#include <rex/logging.h>
 +#include "../../ui/metal/metal_util.h"
 +#include "render_target_shaders.h"
++
++REXCVAR_DEFINE_BOOL(metal_merge_transfer_pass, true, "GPU",
++                    "Continue a compatible sole-attachment transfer pass with guest draws");
++REXCVAR_DEFINE_BOOL(metal_full_clear_discard, true, "GPU",
++                    "Discard old attachment contents only for exact full-surface resolve clears");
 +
 +namespace rex::graphics::metal {
 +using ui::metal::Adopt;
@@ -2557,6 +2694,19 @@ index 0000000..0c3d9da
 +        }
 +      }
 +    }
++    // A utility pass has only depth/stencil or color slot 0. Adopt it only
++    // when that is exactly the next guest pass (including view, extent and samples).
++    bool compatible = transfer_encoder && REXCVAR_GET(metal_merge_transfer_pass) && i <= 1;
++    for (uint32_t j = 0; compatible && j < targets.size(); ++j)
++      if (j != i && (targets[j] || !last_update_transfers()[j].empty())) compatible = false;
++    if (compatible && targets[i]->texture->width() == width &&
++        targets[i]->texture->height() == height &&
++        targets[i]->texture->sampleCount() == samples &&
++        (!i || targets[i]->transfer == targets[i]->texture)) {
++      submission_.SetRenderEncoder(transfer_encoder);
++      transfer_encoder = nullptr;
++      PERF_METAL_counter_add(kMetalTransferPassesMerged, 1);
++    }
 +    EndUtilityPass(transfer_encoder, false);
 +  }
 +  bound_ = targets;
@@ -2586,8 +2736,7 @@ index 0000000..0c3d9da
 +  }
 +  auto* encoder = submission_.buffer()->renderCommandEncoder(pass);
 +  if (!encoder) return false;
-+  submission_.encoder = encoder;
-+  encoder->retain();
++  submission_.SetRenderEncoder(encoder);
 +  for (auto* rt : bound_) if (rt) rt->initialized = true;
 +  PERF_METAL_counter_add(kRenderPassesBegun, 1);
 +  return true;
@@ -2862,7 +3011,8 @@ index 0000000..0c3d9da
 +  } else PERF_METAL_counter_add(kMetalPipelinesCreated, 1);
 +  return entry;
 +}
-+bool MetalRenderTargetCache::DumpRenderTargets(const draw_util::ResolveInfo& info) {
++bool MetalRenderTargetCache::DumpRenderTargets(const draw_util::ResolveInfo& info,
++                                                     MTL::ComputeCommandEncoder*& encoder) {
 +  if (!EnsureEdram()) return false;
 +  uint32_t base, row_length, rows, pitch;
 +  info.GetCopyEdramTileSpan(base, row_length, rows, pitch);
@@ -2895,8 +3045,7 @@ index 0000000..0c3d9da
 +    }
 +    const auto& compute = compute_.at(shader_key);
 +    if (!compute.pipeline) return false;
-+    auto* encoder = submission_.buffer()->computeCommandEncoder();
-+    if (!encoder) return false;
++    if (!submission_.NextComputeEncoder(encoder)) return false;
 +    encoder->setComputePipelineState(compute.pipeline);
 +    encoder->setBuffer(edram_, 0, 1);
 +    encoder->setTexture(key.is_depth ? target->texture : target->transfer, 0);
@@ -2911,6 +3060,7 @@ index 0000000..0c3d9da
 +          ((base + dispatch.offset) & ((1u << (xenos::kEdramBaseTilesBits + 1)) - 1)) |
 +              (uint32_t(key.base_tiles) << (xenos::kEdramBaseTilesBits + 1))};
 +      encoder->setBytes(constants.data(), sizeof(constants), 0);
++      PERF_METAL_counter_add(kMetalComputeDispatches, 1);
 +      encoder->dispatchThreadgroups(MTL::Size(
 +          ((xenos::kEdramTileWidthSamples >> uint32_t(key.Is64bpp())) * dispatch.width_tiles +
 +            compute.group[0] - 1) / compute.group[0],
@@ -2918,9 +3068,8 @@ index 0000000..0c3d9da
 +            compute.group[1], 1),
 +          MTL::Size(compute.group[0], compute.group[1], compute.group[2]));
 +    }
-+    encoder->endEncoding();
 +  }
-+  // Tracked resources order dump writes before the separate resolve encoder.
++  // The caller closes on failure and inserts a barrier before the resolve reads.
 +  return true;
 +}
 +bool MetalRenderTargetCache::StoreHostDepth(Target& target, const Transfer& transfer,
@@ -2931,8 +3080,8 @@ index 0000000..0c3d9da
 +  const auto& compute = GetCompute(0x100 + uint32_t(key.msaa_samples),
 +      code.words, code.count, sizeof(HostDepthStoreConstants), true);
 +  if (!compute.pipeline) return false;
-+  auto* encoder = submission_.buffer()->computeCommandEncoder();
-+  if (!encoder) return false;
++  MTL::ComputeCommandEncoder* encoder = nullptr;
++  if (!submission_.NextComputeEncoder(encoder)) return false;
 +  encoder->setComputePipelineState(compute.pipeline);
 +  encoder->setBuffer(edram_, 0, 1);
 +  encoder->setTexture(target.texture, 0);
@@ -2947,6 +3096,7 @@ index 0000000..0c3d9da
 +    GetHostDepthStoreRectangleInfo(rectangles[i], key.msaa_samples, constants.rectangle,
 +                                   groups_x, groups_y);
 +    encoder->setBytes(&constants, sizeof(constants), 0);
++    PERF_METAL_counter_add(kMetalComputeDispatches, 1);
 +    encoder->dispatchThreadgroups(MTL::Size(groups_x, groups_y, 1),
 +        MTL::Size(compute.group[0], compute.group[1], compute.group[2]));
 +  }
@@ -3062,7 +3212,19 @@ index 0000000..0c3d9da
 +      Attachment(pass->colorAttachments()->object(0), target.transfer, !target.initialized);
 +      pass->colorAttachments()->object(0)->setClearColor(MTL::ClearColor(0, 0, 0, 0));
 +    }
++    const bool discard = REXCVAR_GET(metal_full_clear_discard) &&
++        !rectangle.x_pixels && !rectangle.y_pixels &&
++        rectangle.width_pixels == target.texture->width() &&
++        rectangle.height_pixels == target.texture->height();
++    if (discard) {
++      // This shader overwrites every sample and channel, including depth and stencil.
++      if (key.is_depth) {
++        pass->depthAttachment()->setLoadAction(MTL::LoadActionDontCare);
++        pass->stencilAttachment()->setLoadAction(MTL::LoadActionDontCare);
++      } else pass->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionDontCare);
++    }
 +    encoder = submission_.buffer()->renderCommandEncoder(pass);
++    if (encoder && discard) PERF_METAL_counter_add(kMetalFullClearDiscards, 1);
 +    if (!encoder) return false;
 +    PERF_METAL_counter_add(kRenderPassesBegun, 1);
 +  }
@@ -3130,15 +3292,20 @@ index 0000000..0c3d9da
 +    if (!shared.RequestRangeForGpuWrite(info.copy_dest_extent_start, info.copy_dest_extent_length))
 +      return UnsupportedResolve(4);
 +    // A CPU upload hazard may have submitted the previous command buffer.
-+    if (!submission_.Begin() || !DumpRenderTargets(info)) return UnsupportedResolve(5);
-+    auto* encoder = submission_.buffer()->computeCommandEncoder();
-+    if (!encoder) return UnsupportedResolve(7);
++    if (!submission_.Begin()) return UnsupportedResolve(5);
++    MTL::ComputeCommandEncoder* encoder = nullptr;
++    if (!DumpRenderTargets(info, encoder)) {
++      if (encoder) encoder->endEncoding();
++      return UnsupportedResolve(5);
++    }
++    if (!submission_.NextComputeEncoder(encoder)) return UnsupportedResolve(7);
 +    encoder->setComputePipelineState(compute.pipeline);
 +    encoder->setBuffer(edram_, 0, 1);
 +    encoder->setBuffer(shared.buffer(), 0, 2);
 +    // Bind the full 512 MiB guest buffer: dest_base remains the guest byte
 +    // address (Vulkan subtracts a per-resolve buffer binding offset instead).
 +    encoder->setBytes(&constants, sizeof(constants), 0);
++    PERF_METAL_counter_add(kMetalComputeDispatches, 1);
 +    encoder->dispatchThreadgroups(MTL::Size(groups_x, groups_y, 1),
 +        MTL::Size(compute.group[0], compute.group[1], compute.group[2]));
 +    encoder->endEncoding();
@@ -3367,10 +3534,10 @@ index 0000000..224274c
 +}  // namespace rex::graphics::metal
 diff --git a/src/graphics/metal/resources.cpp b/src/graphics/metal/resources.cpp
 new file mode 100644
-index 0000000..b683ce1
+index 0000000..c1d0f70
 --- /dev/null
 +++ b/src/graphics/metal/resources.cpp
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,387 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2021-2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
@@ -3386,6 +3553,14 @@ index 0000000..b683ce1
 +#include <rex/graphics/flags.h>
 +#include <rex/perf/counter.h>
 +#include "../../ui/metal/metal_util.h"
++
++REXCVAR_DEFINE_BOOL(metal_staged_uploads, false, "GPU",
++                    "Use ordered blits from fresh upload slices for in-flight shared-memory pages");
++REXCVAR_DEFINE_BOOL(metal_batch_compute, true, "GPU",
++                    "Reuse adjacent compute encoders with explicit buffer barriers");
++REXCVAR_DEFINE_BOOL(metal_resident_range_fast_path, true, "GPU",
++                    "Skip range preparation when a single Metal range is already valid")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 +
 +REXCVAR_DEFINE_UINT64(metal_trace_resolves, 0, "GPU",
 +                     "Trace resolves, transfers, texture reloads and swaps for N frames; 0 disables");
@@ -3458,6 +3633,9 @@ index 0000000..b683ce1
 +  pending_.push_back({epoch_++, buffer_, uniforms_});
 +  buffer_->commit();
 +  buffer_ = nullptr;
++  // Encoded blits retain their source chunks until completion. Never CPU-reuse them.
++  ReleaseObject(uploads_);
++  upload_offset_ = 0;
 +  uniforms_ = nullptr;
 +  uniform_offset_ = 0;
 +  PERF_METAL_counter_add(kSubmissions, 1);
@@ -3521,6 +3699,43 @@ index 0000000..b683ce1
 +  uniform_offset_ += size;
 +  return true;
 +}
++bool MetalSubmission::AllocateUpload(size_t size, MTL::Buffer*& buffer, size_t& offset) {
++  constexpr size_t kChunkSize = 4 * 1024 * 1024;
++  if (!size || size > kChunkSize || !Begin()) return false;
++  size = (size + 255) & ~size_t(255);
++  if (!uploads_ || upload_offset_ + size > kChunkSize) {
++    auto* chunk = device_->newBuffer(kChunkSize, MTL::ResourceStorageModeShared);
++    if (!chunk) return false;
++    ReleaseObject(uploads_);
++    uploads_ = chunk;
++    upload_offset_ = 0;
++    PERF_METAL_counter_add(kMetalUploadStagingBytesAllocated, kChunkSize);
++  }
++  buffer = uploads_;
++  offset = upload_offset_;
++  upload_offset_ += size;
++  return true;
++}
++bool MetalSubmission::NextComputeEncoder(MTL::ComputeCommandEncoder*& compute) {
++  if (compute) {
++    if (REXCVAR_GET(metal_batch_compute)) {
++      compute->memoryBarrier(MTL::BarrierScopeBuffers);
++      PERF_METAL_counter_add(kMetalComputeEncodersReused, 1);
++      return true;
++    }
++    compute->endEncoding();
++    compute = nullptr;
++  }
++  compute = buffer_->computeCommandEncoder(MTL::DispatchTypeSerial);
++  if (!compute) return false;
++  PERF_METAL_counter_add(kMetalComputeEncoders, 1);
++  return true;
++}
++void MetalSubmission::SetRenderEncoder(MTL::RenderCommandEncoder* value) {
++  encoder = value;
++  encoder->retain();
++  ++render_encoder_id_;  // Pointer equality alone cannot detect allocator address reuse.
++}
 +void MetalSubmission::Finish() {
 +  // Only teardown drains the queue; ordinary submission and cache clearing are async.
 +  Submit();
@@ -3537,6 +3752,7 @@ index 0000000..b683ce1
 +  if (!buffer_) return false;
 +  // No eager copy or bytesNoCopy alias: RequestRanges selects each snapshot.
 +  InitializeCommon();
++  resident_range_fast_path_ = REXCVAR_GET(metal_resident_range_fast_path);
 +  return true;
 +}
 +bool MetalSharedMemory::RequestRangeForGpuWrite(uint32_t start, uint32_t length) {
@@ -3573,6 +3789,29 @@ index 0000000..b683ce1
 +  uint64_t last_use = 0;
 +  for (uint32_t p = start >> 14; p <= (start + length - 1) >> 14; ++p)
 +    last_use = std::max(last_use, last_use_[p]);
++  if (REXCVAR_GET(metal_staged_uploads) && last_use > submission_.completed_epoch()) {
++    MTL::Buffer* staging = nullptr;
++    size_t offset = 0;
++    // Buffer blits require 4-byte alignment. Larger or failed allocations use
++    // the original wait path. Never widen a partial snapshot or read it later.
++    if (!((start | length) & 3) && submission_.AllocateUpload(length, staging, offset)) {
++      submission_.EndEncoding(perf::CounterId::kPassEndBarrierUpload);
++      auto* blit = submission_.buffer()->blitCommandEncoder();
++      if (blit) {
++        if (make_valid) MakeRangeValid(start, length, false);
++        std::memcpy(static_cast<uint8_t*>(staging->contents()) + offset,
++                    memory().TranslatePhysical(start), length);
++        blit->copyFromBuffer(staging, offset, buffer_, start, length);
++        blit->endEncoding();
++        // The queued blit is itself a writer hazard for subsequent CPU copies.
++        MarkUsed(start, length);
++        PERF_METAL_counter_add(kUploadBytes, length);
++        PERF_METAL_counter_add(kMetalUploadStagedBytes, length);
++        return true;
++      }
++    }
++    PERF_METAL_counter_add(kMetalUploadFallbacks, 1);
++  }
 +  if (!submission_.BeforeUpload(last_use)) return false;
 +  // Protect immediately before the copy so concurrent guest writes invalidate
 +  // the snapshot, exactly as in VulkanSharedMemory::UploadRanges.
@@ -3688,10 +3927,10 @@ index 0000000..b683ce1
 +#endif
 diff --git a/src/graphics/metal/texture_cache.cpp b/src/graphics/metal/texture_cache.cpp
 new file mode 100644
-index 0000000..e9acede
+index 0000000..0a2815c
 --- /dev/null
 +++ b/src/graphics/metal/texture_cache.cpp
-@@ -0,0 +1,706 @@
+@@ -0,0 +1,726 @@
 +// Adapted from ReXGlue's Vulkan texture cache; Xenia, BSD (see LICENSE).
 +// Copyright 2022 Ben Vanik. All rights reserved.
 +#include <rex/graphics/metal/texture_cache.h>
@@ -3701,6 +3940,9 @@ index 0000000..e9acede
 +#include <rex/graphics/flags.h>
 +#include <rex/logging.h>
 +#include "../../ui/metal/metal_util.h"
++
++REXCVAR_DEFINE_BOOL(metal_texture_request_fast_path, true, "GPU",
++                    "Reuse clean texture requests within a submission, including prepared slices");
 +
 +namespace rex::graphics::metal {
 +namespace shaders {
@@ -3776,6 +4018,7 @@ index 0000000..e9acede
 +void MetalTextureCache::SyncSubmission() {
 +  if (cache_epoch_ != submission_.epoch()) {
 +    cache_epoch_ = submission_.epoch();
++    prepared_mask_ = 0;
 +    BeginSubmission(cache_epoch_);
 +  }
 +}
@@ -3783,19 +4026,32 @@ index 0000000..e9acede
 +  SyncSubmission();
 +  // Evict only outside the base class's pending-load traversal.
 +  CompletedSubmissionUpdated(submission_.completed_epoch());
++  if (REXCVAR_GET(metal_texture_request_fast_path) && !(mask & ~prepared_mask_) &&
++      TextureBindingsInSync(mask)) {
++    PERF_METAL_counter_add(kMetalTextureRequestFastPaths, 1);
++    return;
++  }
++  prepared_mask_ &= ~mask;
 +  TextureCache::RequestTextures(mask);
 +  SyncSubmission();  // A shared-memory upload may have split the submission.
 +  for (uint32_t i = 0; i < 32; ++i) {
 +    if (!(mask & (1u << i))) continue;
 +    const auto* binding = GetValidTextureBinding(i);
 +    if (!binding) continue;
++    bool prepared = true;
 +    for (auto* base : {binding->texture, binding->texture_signed}) {
 +      if (!base) continue;
 +      base->MarkAsUsed();
 +      auto& texture = *static_cast<MetalTexture*>(base);
-+      if (!base->outdated_mask() && base->key().dimension == xenos::DataDimension::k3D &&
-+          REXCVAR_GET(gpu_3d_to_2d_texture)) PrepareSlice(texture);
++      if (base->outdated_mask()) { prepared = false; continue; }
++      // Prepare even when 3D emulation is currently disabled, or leave this
++      // binding off the fast path so a runtime flag change can prepare it.
++      if (base->key().dimension == xenos::DataDimension::k3D) {
++        if (REXCVAR_GET(gpu_3d_to_2d_texture)) prepared &= PrepareSlice(texture);
++        else prepared = false;
++      }
 +    }
++    if (prepared) prepared_mask_ |= 1u << i;
 +  }
 +}
 +bool MetalTextureCache::UnsupportedResolveTexture(uint32_t reason) {
@@ -4195,8 +4451,8 @@ index 0000000..e9acede
 +  SyncSubmission();
 +  texture.MarkAsUsed();
 +  submission_.EndEncoding(perf::CounterId::kPassEndBarrierTexture);
-+  auto* encoder = submission_.buffer()->computeCommandEncoder();
-+  if (!encoder) return false;
++  MTL::ComputeCommandEncoder* encoder = nullptr;
++  if (!submission_.NextComputeEncoder(encoder)) return false;
 +  encoder->setComputePipelineState(pipeline);
 +  encoder->setBuffer(untiled_, 0, 1);
 +  encoder->setBuffer(shared_.buffer(), 0, 2);
@@ -4209,6 +4465,7 @@ index 0000000..e9acede
 +      std::memcpy(constants.data(), &c, sizeof(c));
 +      encoder->setBytes(constants.data(), sizeof(constants), 0);
 +      const uint32_t gx = 1u << info.GetGuestXBlocksPerGroupLog2();
++      PERF_METAL_counter_add(kMetalComputeDispatches, 1);
 +      encoder->dispatchThreadgroups(
 +          MTL::Size((c.size_blocks[0] + gx - 1) / gx, (c.size_blocks[1] + 31) / 32,
 +                    c.size_blocks[2]), MTL::Size(4, 32, 1));
@@ -4216,18 +4473,17 @@ index 0000000..e9acede
 +      c.host_offset += s.slice_bytes;
 +    }
 +  }
-+  encoder->endEncoding();
 +  // Mark source ranges even if a later encoder allocation fails: the compute
 +  // reads have already been queued, and CPU snapshot overwrites must wait.
 +  if (load_base) shared_.MarkUsed(key.base_page << 12, rex::align(texture.GetGuestBaseSize(), 16u));
 +  if (load_mips) shared_.MarkUsed(key.mip_page << 12, rex::align(texture.GetGuestMipsSize(), 16u));
-+  encoder = submission_.buffer()->computeCommandEncoder();
-+  if (!encoder) return false;
++  if (!submission_.NextComputeEncoder(encoder)) return false;
 +  encoder->setComputePipelineState(repack_.pipeline);
 +  encoder->setBuffer(untiled_, 0, 0);
 +  encoder->setBuffer(upload_, 0, 1);
 +  for (const auto& copy : copies) {
 +    encoder->setBytes(copy.c.data(), sizeof(copy.c), 2);
++    PERF_METAL_counter_add(kMetalComputeDispatches, 1);
 +    encoder->dispatchThreadgroups(MTL::Size((copy.c[8] + 15) / 16, (copy.c[9] + 7) / 8,
 +                                            copy.depth), MTL::Size(16, 8, 1));
 +  }
@@ -4242,6 +4498,9 @@ index 0000000..e9acede
 +  // All resources use Metal's tracked hazards, on the same queue as guest draws.
 +  texture.slice_dirty = true;
 +  PERF_METAL_counter_add(kMetalTextureLoads, 1);
++  const uint32_t loaded_mask = uint32_t(load_base) | (uint32_t(load_mips) << 1);
++  if (texture.loaded_mask & loaded_mask) PERF_METAL_counter_add(kMetalTextureReloads, 1);
++  texture.loaded_mask |= loaded_mask;
 +  return true;
 +}
 +bool MetalTextureCache::PrepareSlice(MetalTexture& texture) {
@@ -4425,6 +4684,44 @@ index ec756d3..59d3fa5 100644
  #endif
    REXLOG_ERROR("rexgpu-xenos: requested backend '{}' is not compiled into this plugin", backend);
    return nullptr;
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index 0e35fea..c5d51cf 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -444,6 +444,33 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     return true;
+   }
+ 
++#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
++  if (resident_range_fast_path_ && count == 1 &&
++      REXCVAR_GET(shared_memory_request_granularity_log2) <= page_size_log2_) {
++    const auto [start, length] = ranges[0];
++    if (length && start < kBufferSize && length <= kBufferSize - start) {
++      auto lock = global_critical_region_.Acquire();
++      // Hot pages must still fire texture watches and be snapshotted on every request.
++      if (!AnyPageHot(uint32_t(rex::chrono::Clock::QueryHostUptimeMillis()))) {
++        const uint32_t first = start >> page_size_log2_;
++        const uint32_t last = (start + length - 1) >> page_size_log2_;
++        bool valid = true;
++        for (uint32_t block = first >> 6; block <= (last >> 6); ++block) {
++          uint64_t mask = UINT64_MAX;
++          if (block == (first >> 6)) mask &= UINT64_MAX << (first & 63);
++          if (block == (last >> 6)) mask &= UINT64_MAX >> (63 - (last & 63));
++          if ((system_page_flags_valid_[block] & mask) != mask) { valid = false; break; }
++        }
++        if (valid) {
++          g_shared_memory_requests.fetch_add(1, std::memory_order_relaxed);
++          PERF_METAL_counter_add(kMetalRangeRequestFastPaths, 1);
++          return true;
++        }
++      }
++    }
++  }
++#endif
++
+   // Some texture or buffer is empty, for example - safe to draw in this case.
+   std::vector<std::pair<uint32_t, uint32_t>>& merged_ranges = request_merged_ranges_;
+   merged_ranges.clear();
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
 index a2d6c02..411c387 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
