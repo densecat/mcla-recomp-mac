@@ -2340,13 +2340,14 @@ index 0000000..c92fdc0
 +#endif
 diff --git a/src/graphics/metal/pipeline_cache.cpp b/src/graphics/metal/pipeline_cache.cpp
 new file mode 100644
-index 0000000..a539b5a
+index 0000000..573fbf6
 --- /dev/null
 +++ b/src/graphics/metal/pipeline_cache.cpp
-@@ -0,0 +1,282 @@
+@@ -0,0 +1,289 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2021-2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
++#include <fmt/format.h>
 +#include <atomic>
 +#include <rex/cvar.h>
 +#include <rex/graphics/metal/pipeline_cache.h>
@@ -2363,6 +2364,7 @@ index 0000000..a539b5a
 +                    "Cache Metal shader variants by Shader identity, modification and attachments");
 +
 +
++REXCVAR_DECLARE(bool, metal_gpu_labels);
 +REXCVAR_DEFINE_BOOL(metal_alpha_to_coverage_variants, true, "GPU/Metal",
 +                    "Compile pixel shaders without the alpha-to-coverage sample mask for draws "
 +                    "that do not enable it, so the GPU keeps hidden surface removal");
@@ -2558,6 +2560,11 @@ index 0000000..a539b5a
 +  auto desc = Adopt(MTL::RenderPipelineDescriptor::alloc()->init());
 +  desc->setVertexFunction(vs.function);
 +  desc->setFragmentFunction(rasterize && ps ? ps->function : nullptr);
++  if (REXCVAR_GET(metal_gpu_labels)) {
++    std::string label = fmt::format("PSO|vs={:016X}.{:X}|ps={:016X}.{:X}", vs.hash, vs.modification,
++                                    rasterize && ps ? ps->hash : 0, rasterize && ps ? ps->modification : 0);
++    desc->setLabel(NS::String::string(label.c_str(), NS::UTF8StringEncoding));
++  }
 +  desc->setRasterizationEnabled(rasterize);
 +  desc->setRasterSampleCount(samples);
 +  desc->setInputPrimitiveTopology(primitive == xenos::PrimitiveType::kPointList
