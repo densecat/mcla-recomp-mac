@@ -1177,10 +1177,10 @@ index 6978e3f..8015868 100644
          Vulkan::Headers
 diff --git a/src/graphics/metal/command_processor.cpp b/src/graphics/metal/command_processor.cpp
 new file mode 100644
-index 0000000..6c56554
+index 0000000..1947ddd
 --- /dev/null
 +++ b/src/graphics/metal/command_processor.cpp
-@@ -0,0 +1,754 @@
+@@ -0,0 +1,760 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2021-2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
@@ -1352,6 +1352,7 @@ index 0000000..6c56554
 +    color->setStoreAction(MTL::StoreActionStore);
 +    auto* encoder = context.command_buffer()->renderCommandEncoder(pass);
 +    if (!encoder) return false;
++    METAL_GPU_LABEL(GpuRender(encoder, pass, "PRESENT|gamma"));
 +    PERF_METAL_counter_add(kRenderPassesBegun, 1);
 +    encoder->setRenderPipelineState(pipeline);
 +    encoder->setFragmentTexture(source, 0);
@@ -1363,6 +1364,8 @@ index 0000000..6c56554
 +    encoder->setScissorRect(MTL::ScissorRect{0, 0, output->width(), output->height()});
 +    encoder->setCullMode(MTL::CullModeNone);
 +    encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
++    METAL_GPU_LABEL(GpuCount(encoder));
++    METAL_GPU_LABEL(GpuEnd(encoder));
 +    encoder->endEncoding();
 +    PERF_METAL_counter_add(kPassEndSwap, 1);
 +    context.SetIs8bpc(true);  // Existing presenter mailbox is BGRA8.
@@ -1667,7 +1670,9 @@ index 0000000..6c56554
 +      s.submission.EndEncoding(perf::CounterId::kPassEndMemexport);
 +      auto* blit = s.submission.buffer()->blitCommandEncoder();
 +      if (!blit) return fail("index snapshot encoder");
++      METAL_GPU_LABEL(GpuWork(blit, "BLT|index-snapshot", size, "bytes"));
 +      blit->copyFromBuffer(indices.first, indices.second, index_snapshot.get(), 0, size);
++      METAL_GPU_LABEL(GpuEnd(blit));
 +      blit->endEncoding();
 +      s.shared.MarkUsed(p.guest_index_base, uint32_t(size));
 +      indices = {index_snapshot.get(), 0};
@@ -1811,6 +1816,7 @@ index 0000000..6c56554
 +  } else {
 +    e->drawPrimitives(primitive, NS::UInteger(0), NS::UInteger(p.host_draw_vertex_count));
 +  }
++  METAL_GPU_LABEL(GpuCount(e));
 +  if (rasterize) s.targets.MarkDraw(color_mask, width, height);
 +  PERF_METAL_counter_add(kDrawCalls, 1);
 +  PERF_METAL_counter_add(kVerticesProcessed, p.host_draw_vertex_count);
@@ -2049,18 +2055,29 @@ index 0000000..df99bd4
 +}
 diff --git a/src/graphics/metal/graphics_system.cpp b/src/graphics/metal/graphics_system.cpp
 new file mode 100644
-index 0000000..1a15ca3
+index 0000000..7959d7e
 --- /dev/null
 +++ b/src/graphics/metal/graphics_system.cpp
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,27 @@
 +#include <rex/graphics/metal/graphics_system.h>
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +
 +#include <rex/graphics/metal/command_processor.h>
++#include <rex/cvar.h>
++#include <rex/logging.h>
 +#include <rex/ui/metal/provider.h>
 +
 +namespace rex::graphics::metal {
 +void MetalGraphicsSystem::CreateProvider(bool) {
++  // A CPU write invalidates this many 16 KiB pages around it. The shared
++  // default of 64 pages (1 MiB) invalidated about 400 unrelated textures per
++  // frame in MCLA's title scene, and each reload ended a render pass; one
++  // page cut that to about 60. Only when the user has not set it.
++  if (rex::cvar::GetFlagSource("shared_memory_invalidation_pages_log2") ==
++      rex::cvar::Source::kDefault) {
++    rex::cvar::SetFlagByName("shared_memory_invalidation_pages_log2", "0");
++    REXLOG_INFO("Metal: shared_memory_invalidation_pages_log2 defaults to 0");
++  }
 +  provider_ = ui::metal::MetalProvider::Create();
 +}
 +
@@ -2558,10 +2575,10 @@ index 0000000..a509a64
 +#endif
 diff --git a/src/graphics/metal/render_target_cache.cpp b/src/graphics/metal/render_target_cache.cpp
 new file mode 100644
-index 0000000..9dc0456
+index 0000000..922cfa6
 --- /dev/null
 +++ b/src/graphics/metal/render_target_cache.cpp
-@@ -0,0 +1,895 @@
+@@ -0,0 +1,926 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
@@ -2636,6 +2653,7 @@ index 0000000..9dc0456
 +}
 +void EndUtilityPass(MTL::RenderCommandEncoder*& encoder, bool resolve) {
 +  if (!encoder) return;
++  METAL_GPU_LABEL(GpuEnd(encoder));
 +  encoder->endEncoding();
 +  encoder = nullptr;
 +  if (resolve) PERF_METAL_counter_add(kPassEndResolve, 1);
@@ -2810,6 +2828,7 @@ index 0000000..9dc0456
 +        targets[i]->texture->height() == height &&
 +        targets[i]->texture->sampleCount() == samples &&
 +        (!i || targets[i]->transfer == targets[i]->texture)) {
++      METAL_GPU_LABEL(GpuWork(transfer_encoder, "guest", 0, "draws"));
 +      submission_.SetRenderEncoder(transfer_encoder);
 +      transfer_encoder = nullptr;
 +      PERF_METAL_counter_add(kMetalTransferPassesMerged, 1);
@@ -2846,6 +2865,7 @@ index 0000000..9dc0456
 +  }
 +  auto* encoder = submission_.buffer()->renderCommandEncoder(pass);
 +  if (!encoder) return false;
++  METAL_GPU_LABEL(GpuRender(encoder, pass, "RP|guest"));
 +  submission_.SetRenderEncoder(encoder);
 +  for (auto* rt : bound_) if (rt) rt->initialized = true;
 +  PERF_METAL_counter_add(kRenderPassesBegun, 1);
@@ -2992,6 +3012,7 @@ index 0000000..9dc0456
 +    }
 +    encoder = submission_.buffer()->renderCommandEncoder(pass);
 +    if (!encoder) return false;
++    METAL_GPU_LABEL(GpuRender(encoder, pass, "RP|xfer"));
 +    PERF_METAL_counter_add(kRenderPassesBegun, 1);
 +  }
 +  encoder->setRenderPipelineState(pipeline);
@@ -3011,6 +3032,9 @@ index 0000000..9dc0456
 +  encoder->setFragmentBytes(constants.data(), host ? 8 : 4, 0);
 +  encoder->setViewport(MTL::Viewport{0, 0, double(dest.texture->width()),
 +                                      double(dest.texture->height()), 0, 1});
++  METAL_GPU_LABEL(GpuWork(encoder, fmt::format("xfer:{}>{}:host={}",
++      sk.is_depth ? "depth" : "color", dk.is_depth ? "depth" : "color",
++      host_depth_copy ? "copy" : host ? "texture" : "none"), count, "draws"));
 +  for (uint32_t i = 0; i < count; ++i) {
 +    auto r = rectangles[i];
 +    encoder->setScissorRect(MTL::ScissorRect{r.x_pixels, r.y_pixels, r.width_pixels, r.height_pixels});
@@ -3043,6 +3067,7 @@ index 0000000..9dc0456
 +  color->setStoreAction(MTL::StoreActionStore);
 +  auto* encoder = buffer->renderCommandEncoder(pass);
 +  if (!encoder) return false;
++  METAL_GPU_LABEL(GpuRender(encoder, pass, "PRESENT|debug-rt"));
 +  PERF_METAL_counter_add(kRenderPassesBegun, 1);
 +  encoder->setRenderPipelineState(pipeline);
 +  encoder->setFragmentTexture(debug_target_->texture, 0);
@@ -3052,6 +3077,8 @@ index 0000000..9dc0456
 +  encoder->setFragmentBytes(constants.data(), sizeof(constants), 0);
 +  encoder->setViewport(MTL::Viewport{0, 0, double(output->width()), double(output->height()), 0, 1});
 +  encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
++  METAL_GPU_LABEL(GpuCount(encoder));
++  METAL_GPU_LABEL(GpuEnd(encoder));
 +  encoder->endEncoding();
 +  PERF_METAL_counter_add(kPassEndSwap, 1);
 +  return true;
@@ -3092,7 +3119,9 @@ index 0000000..9dc0456
 +  if (!edram_zeroed_) {
 +    auto* blit = submission_.buffer()->blitCommandEncoder();
 +    if (!blit) return false;
++    METAL_GPU_LABEL(GpuWork(blit, "BLT|edram-clear", xenos::kEdramSizeBytes, "bytes"));
 +    blit->fillBuffer(edram_, NS::Range::Make(0, xenos::kEdramSizeBytes), 0);
++    METAL_GPU_LABEL(GpuEnd(blit));
 +    blit->endEncoding();
 +    edram_zeroed_ = true;
 +  }
@@ -3162,6 +3191,10 @@ index 0000000..9dc0456
 +    if (key.is_depth) encoder->setTexture(target->stencil, 1);
 +    ResolveCopyDumpRectangle::Dispatch dispatches[ResolveCopyDumpRectangle::kMaxDispatches];
 +    uint32_t count = rectangle.GetDispatches(pitch, row_length, dispatches);
++    METAL_GPU_LABEL(GpuWork(encoder, fmt::format(
++        "CS-xfer|{}-to-edram|fmt={}|bpp={}|msaa={}", key.is_depth ? "depth" : "color",
++        uint32_t(key.resource_format), key.Is64bpp() ? 64 : 32,
++        1u << uint32_t(key.msaa_samples)), count, "dispatches"));
 +    for (uint32_t i = 0; i < count; ++i) {
 +      const auto& dispatch = dispatches[i];
 +      // Vulkan DumpPitches and DumpOffsets, preserving wrapping's extra bit.
@@ -3201,6 +3234,9 @@ index 0000000..9dc0456
 +  Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
 +  uint32_t count = transfer.GetRectangles(key.base_tiles, key.GetPitchTiles(),
 +                                          key.msaa_samples, false, rectangles, cutout);
++  METAL_GPU_LABEL(GpuWork(encoder, fmt::format("CS-depthstore|msaa={}|{}x{}",
++      1u << uint32_t(key.msaa_samples), target.texture->width(), target.texture->height()),
++      count, "dispatches"));
 +  for (uint32_t i = 0; i < count; ++i) {
 +    uint32_t groups_x, groups_y;
 +    GetHostDepthStoreRectangleInfo(rectangles[i], key.msaa_samples, constants.rectangle,
@@ -3210,6 +3246,7 @@ index 0000000..9dc0456
 +    encoder->dispatchThreadgroups(MTL::Size(groups_x, groups_y, 1),
 +        MTL::Size(compute.group[0], compute.group[1], compute.group[2]));
 +  }
++  METAL_GPU_LABEL(GpuEnd(encoder));
 +  encoder->endEncoding();
 +  return true;
 +}
@@ -3336,6 +3373,7 @@ index 0000000..9dc0456
 +    encoder = submission_.buffer()->renderCommandEncoder(pass);
 +    if (encoder && discard) PERF_METAL_counter_add(kMetalFullClearDiscards, 1);
 +    if (!encoder) return false;
++    METAL_GPU_LABEL(GpuRender(encoder, pass, "RP|clear"));
 +    PERF_METAL_counter_add(kRenderPassesBegun, 1);
 +  }
 +  encoder->setRenderPipelineState(it->second);
@@ -3346,6 +3384,7 @@ index 0000000..9dc0456
 +  encoder->setScissorRect(MTL::ScissorRect{rectangle.x_pixels, rectangle.y_pixels,
 +                                         rectangle.width_pixels, rectangle.height_pixels});
 +  encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
++  METAL_GPU_LABEL(GpuWork(encoder, "clear", 1, "draws"));
 +  target.initialized = true;
 +  return true;
 +}
@@ -3405,7 +3444,10 @@ index 0000000..9dc0456
 +    if (!submission_.Begin()) return UnsupportedResolve(5);
 +    MTL::ComputeCommandEncoder* encoder = nullptr;
 +    if (!DumpRenderTargets(info, encoder)) {
-+      if (encoder) encoder->endEncoding();
++      if (encoder) {
++        METAL_GPU_LABEL(GpuEnd(encoder));
++        encoder->endEncoding();
++      }
 +      return UnsupportedResolve(5);
 +    }
 +    if (!submission_.NextComputeEncoder(encoder)) return UnsupportedResolve(7);
@@ -3415,9 +3457,15 @@ index 0000000..9dc0456
 +    // Bind the full 512 MiB guest buffer: dest_base remains the guest byte
 +    // address (Vulkan subtracts a per-resolve buffer binding offset instead).
 +    encoder->setBytes(&constants, sizeof(constants), 0);
++    METAL_GPU_LABEL(GpuWork(encoder, fmt::format("CS-resolve|dst-bpp={}|msaa={}|shader={}",
++        info.IsCopyingDepth() ? 32u :
++            FormatInfo::Get(uint32_t(info.copy_dest_info.copy_dest_format))->bits_per_pixel,
++        1u << uint32_t((info.IsCopyingDepth() ? info.depth_edram_info :
++                       info.color_edram_info).msaa_samples), uint32_t(shader)), 1, "dispatches"));
 +    PERF_METAL_counter_add(kMetalComputeDispatches, 1);
 +    encoder->dispatchThreadgroups(MTL::Size(groups_x, groups_y, 1),
 +        MTL::Size(compute.group[0], compute.group[1], compute.group[2]));
++    METAL_GPU_LABEL(GpuEnd(encoder));
 +    encoder->endEncoding();
 +    shared.MarkGpuWrittenRange(info.copy_dest_extent_start, info.copy_dest_extent_length);
 +    textures.MarkRangeAsResolved(info.copy_dest_extent_start, info.copy_dest_extent_length);
@@ -3644,10 +3692,10 @@ index 0000000..224274c
 +}  // namespace rex::graphics::metal
 diff --git a/src/graphics/metal/resources.cpp b/src/graphics/metal/resources.cpp
 new file mode 100644
-index 0000000..90e293c
+index 0000000..2b8f8ab
 --- /dev/null
 +++ b/src/graphics/metal/resources.cpp
-@@ -0,0 +1,436 @@
+@@ -0,0 +1,442 @@
 +// Adapted from Xenia / ReXGlue's Vulkan host-render-target implementation.
 +// Copyright 2021-2022 Ben Vanik. All rights reserved.
 +// Released under the BSD license - see LICENSE in the root for more details.
@@ -3755,12 +3803,14 @@ index 0000000..90e293c
 +  if (!buffer_) {
 +    buffer_ = queue_->commandBuffer();
 +    if (!buffer_) return false;
++    METAL_GPU_LABEL(GpuCommandBuffer(buffer_, "guest", frame_));
 +    buffer_->retain();  // commandBuffer retains every encoded resource.
 +  }
 +  return true;
 +}
 +void MetalSubmission::EndEncoding([[maybe_unused]] perf::CounterId reason) {
 +  if (encoder) {
++    METAL_GPU_LABEL(GpuEnd(encoder));
 +    encoder->endEncoding();
 +    ReleaseObject(encoder);
 +#if defined(REXGLUE_ENABLE_PERF_COUNTERS) && !REX_PLATFORM_PS5
@@ -3866,6 +3916,7 @@ index 0000000..90e293c
 +      PERF_METAL_counter_add(kMetalComputeEncodersReused, 1);
 +      return true;
 +    }
++    METAL_GPU_LABEL(GpuEnd(compute));
 +    compute->endEncoding();
 +    compute = nullptr;
 +  }
@@ -3886,6 +3937,7 @@ index 0000000..90e293c
 +  if (!BeginFrame() || !Submit(perf::CounterId::kPassEndSwap)) return;
 +  auto* marker = queue_->commandBuffer();
 +  if (!marker) { failed_ = true; return; }
++  METAL_GPU_LABEL(GpuCommandBuffer(marker, "frame-tail", frame_));
 +  marker->retain();
 +  frames_.push_back(marker);
 +  marker->commit();
@@ -3957,10 +4009,12 @@ index 0000000..90e293c
 +      submission_.EndEncoding(perf::CounterId::kPassEndBarrierUpload);
 +      auto* blit = submission_.buffer()->blitCommandEncoder();
 +      if (blit) {
++        METAL_GPU_LABEL(GpuWork(blit, "BLT|staged-upload", length, "bytes"));
 +        if (make_valid) MakeRangeValid(start, length, false);
 +        std::memcpy(static_cast<uint8_t*>(staging->contents()) + offset,
 +                    memory().TranslatePhysical(start), length);
 +        blit->copyFromBuffer(staging, offset, buffer_, start, length);
++        METAL_GPU_LABEL(GpuEnd(blit));
 +        blit->endEncoding();
 +        // The queued blit is itself a writer hazard for subsequent CPU copies.
 +        MarkUsed(start, length);
@@ -4086,10 +4140,10 @@ index 0000000..90e293c
 +#endif
 diff --git a/src/graphics/metal/texture_cache.cpp b/src/graphics/metal/texture_cache.cpp
 new file mode 100644
-index 0000000..69ba4af
+index 0000000..b42d9df
 --- /dev/null
 +++ b/src/graphics/metal/texture_cache.cpp
-@@ -0,0 +1,796 @@
+@@ -0,0 +1,810 @@
 +// Adapted from ReXGlue's Vulkan texture cache; Xenia, BSD (see LICENSE).
 +// Copyright 2022 Ben Vanik. All rights reserved.
 +#include <rex/graphics/metal/texture_cache.h>
@@ -4237,6 +4291,7 @@ index 0000000..69ba4af
 +}
 +bool MetalTextureCache::FlushTextureLoads() {
 +  if (load_encoder_) {
++    METAL_GPU_LABEL(GpuEnd(load_encoder_));
 +    load_encoder_->endEncoding();
 +    load_encoder_ = nullptr;
 +  }
@@ -4245,11 +4300,15 @@ index 0000000..69ba4af
 +  if (blit) {
 +    PERF_METAL_counter_add(kMetalTextureBlitEncoders, 1);
 +    for (const auto& copy : pending_blits_) {
++      METAL_GPU_LABEL(GpuWork(blit, "BLT|texture-upload",
++          ui::metal::GpuTextureBytes(copy.target->pixelFormat(), copy.width, copy.height,
++                                     copy.depth), "bytes"));
 +      blit->copyFromBuffer(copy.source, copy.offset, copy.pitch, copy.image_pitch,
 +          MTL::Size(copy.width, copy.height, copy.depth), copy.target, copy.layer,
 +          copy.level, MTL::Origin(0, 0, 0));
 +      PERF_METAL_counter_add(kMetalTextureBlitCopies, 1);
 +    }
++    METAL_GPU_LABEL(GpuEnd(blit));
 +    blit->endEncoding();
 +  } else {
 +    PERF_METAL_counter_add(kMetalTextureBatchFailures, 1);
@@ -4678,6 +4737,8 @@ index 0000000..69ba4af
 +  submission_.EndEncoding(perf::CounterId::kPassEndBarrierTexture);
 +  auto*& encoder = load_encoder_;
 +  if (!submission_.NextComputeEncoder(encoder)) return false;
++  METAL_GPU_LABEL(GpuWork(encoder, fmt::format("CS-tex|load {} {}x{}",
++      guest_format->name, key.GetWidth(), key.GetHeight()), stored.size() * layers, "dispatches"));
 +  encoder->setComputePipelineState(pipeline);
 +  encoder->setBuffer(untiled_, 0, 1);
 +  encoder->setBuffer(shared_.buffer(), 0, 2);
@@ -4703,6 +4764,8 @@ index 0000000..69ba4af
 +  if (load_base) shared_.MarkUsed(key.base_page << 12, rex::align(texture.GetGuestBaseSize(), 16u));
 +  if (load_mips) shared_.MarkUsed(key.mip_page << 12, rex::align(texture.GetGuestMipsSize(), 16u));
 +  if (!submission_.NextComputeEncoder(encoder)) return false;
++  METAL_GPU_LABEL(GpuWork(encoder, fmt::format("CS-tex|repack {} {}x{}",
++      guest_format->name, key.GetWidth(), key.GetHeight()), copies.size(), "dispatches"));
 +  encoder->setComputePipelineState(repack_.pipeline);
 +  encoder->setBuffer(untiled_, 0, 0);
 +  encoder->setBuffer(upload_, 0, 1);
@@ -4751,10 +4814,15 @@ index 0000000..69ba4af
 +  auto* blit = submission_.buffer()->blitCommandEncoder();
 +  if (!blit) return false;
 +  const auto key = texture.key();
-+  for (uint32_t level = key.base_page ? 0 : 1; level <= key.mip_max_level; ++level)
++  METAL_GPU_LABEL(GpuWork(blit, "BLT|texture-slice", 0, "bytes"));
++  for (uint32_t level = key.base_page ? 0 : 1; level <= key.mip_max_level; ++level) {
++    METAL_GPU_LABEL(GpuCount(blit, ui::metal::GpuTextureBytes(texture.image->pixelFormat(),
++        std::max(key.GetWidth() >> level, 1u), std::max(key.GetHeight() >> level, 1u))));
 +    blit->copyFromTexture(texture.image, 0, level, MTL::Origin(0, 0, 0),
 +        MTL::Size(std::max(key.GetWidth() >> level, 1u), std::max(key.GetHeight() >> level, 1u), 1),
 +        texture.slice, 0, level, MTL::Origin(0, 0, 0));
++  }
++  METAL_GPU_LABEL(GpuEnd(blit));
 +  blit->endEncoding();
 +  texture.slice_dirty = false;
 +  return true;
@@ -5470,10 +5538,10 @@ index 5e450f4..8e410d9 100644
  target_include_directories(rexui PUBLIC
 diff --git a/src/ui/metal/immediate_drawer.cpp b/src/ui/metal/immediate_drawer.cpp
 new file mode 100644
-index 0000000..4a0250a
+index 0000000..7e9bb10
 --- /dev/null
 +++ b/src/ui/metal/immediate_drawer.cpp
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,222 @@
 +#include <rex/ui/metal/immediate_drawer.h>
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +
@@ -5678,6 +5746,7 @@ index 0000000..4a0250a
 +  } else {
 +    encoder_->drawPrimitives(primitive, NS::UInteger(draw.base_vertex), NS::UInteger(draw.count));
 +  }
++  METAL_GPU_LABEL(GpuCount(encoder_));
 +}
 +
 +void MetalImmediateDrawer::EndDrawBatch() {
@@ -5697,10 +5766,10 @@ index 0000000..4a0250a
 +#endif
 diff --git a/src/ui/metal/metal_api.cpp b/src/ui/metal/metal_api.cpp
 new file mode 100644
-index 0000000..26fcf78
+index 0000000..c6a5337
 --- /dev/null
 +++ b/src/ui/metal/metal_api.cpp
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,115 @@
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +// The sole metal-cpp implementation TU. Do not add it to rexgpu-xenos.
 +#define NS_PRIVATE_IMPLEMENTATION
@@ -5709,22 +5778,146 @@ index 0000000..26fcf78
 +#include <Foundation/Foundation.hpp>
 +#include <Metal/Metal.hpp>
 +#include <QuartzCore/QuartzCore.hpp>
++#include "metal_util.h"
++#include <algorithm>
++#include <atomic>
++#include <unordered_map>
++#include <vector>
++
++REXCVAR_DEFINE_BOOL(metal_gpu_labels, false, "GPU", "Label Metal GPU work for Instruments")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++namespace rex::ui::metal {
++namespace {
++struct EncoderLabel {
++  std::vector<std::string> roles;
++  uint64_t count = 0;
++  const char* unit = nullptr;
++};
++// Stored in rexruntime once, also used by rexgpu-xenos. No resource ownership.
++thread_local std::unordered_map<MTL::CommandEncoder*, EncoderLabel> gpu_labels;
++template <typename T>
++void SetGpuLabel(T* object, const std::string& text) {
++  object->setLabel(NS::String::string(text.c_str(), NS::UTF8StringEncoding));
++}
++}
++void GpuCommandBuffer(MTL::CommandBuffer* buffer, const char* role, uint64_t frame) {
++  static std::atomic<uint64_t> serial{0};
++  const auto id = serial.fetch_add(1, std::memory_order_relaxed) + 1;
++  // UI painting can be asynchronous; do not invent a guest frame for it.
++  SetGpuLabel(buffer, frame ? fmt::format("mcla frame {} cb {}|{}", frame, id, role)
++                            : fmt::format("PRESENT|cb {}|{}", id, role));
++}
++void GpuWork(MTL::CommandEncoder* encoder, std::string role, uint64_t count, const char* unit) {
++  auto& label = gpu_labels[encoder];
++  if (label.roles.empty()) SetGpuLabel(encoder, role);
++  if (std::find(label.roles.begin(), label.roles.end(), role) == label.roles.end())
++    label.roles.push_back(std::move(role));
++  label.count += count;
++  label.unit = unit;
++}
++void GpuCount(MTL::CommandEncoder* encoder, uint64_t count) {
++  gpu_labels.at(encoder).count += count;
++}
++void GpuEnd(MTL::CommandEncoder* encoder) {
++  auto it = gpu_labels.find(encoder);
++  if (it == gpu_labels.end()) return;
++  const auto& label = it->second;
++  std::string text;
++  for (const auto& role : label.roles) {
++    if (!text.empty()) text += "+";
++    text += role;
++  }
++  text += fmt::format("|{}={}", label.unit, label.count);
++  // MTLCommandEncoder.label is writable; set the final count before endEncoding.
++  SetGpuLabel(encoder, text);
++  gpu_labels.erase(it);
++}
++void GpuRender(MTL::RenderCommandEncoder* encoder, MTL::RenderPassDescriptor* pass,
++               const char* role) {
++  auto width = pass->renderTargetWidth(), height = pass->renderTargetHeight();
++  auto samples = pass->defaultRasterSampleCount();
++  std::string attachments;
++  auto attachment = [&](const std::string& name, MTL::RenderPassAttachmentDescriptor* a) {
++    auto* texture = a->texture();
++    if (!texture) { attachments += fmt::format("|{}=none", name); return; }
++    auto w = std::max(NS::UInteger(1), texture->width() >> a->level());
++    auto h = std::max(NS::UInteger(1), texture->height() >> a->level());
++    width = width ? std::min(width, w) : w;
++    height = height ? std::min(height, h) : h;
++    samples = texture->sampleCount();
++    attachments += fmt::format("|{}={}/L{}/S{}", name, uint32_t(texture->pixelFormat()),
++                                uint32_t(a->loadAction()), uint32_t(a->storeAction()));
++  };
++  for (uint32_t i = 0; i < 8; ++i) {
++    auto* a = pass->colorAttachments()->object(i);
++    if (a->texture()) attachment(fmt::format("c{}", i), a);
++  }
++  attachment("d", pass->depthAttachment());
++  attachment("s", pass->stencilAttachment());
++  GpuWork(encoder, fmt::format("{}|{}x{}|msaa={}{}", role, width, height, samples,
++                               attachments), 0, "draws");
++}
++uint64_t GpuTextureBytes(MTL::PixelFormat format, uint64_t width, uint64_t height,
++                         uint64_t depth) {
++  // Payload bytes, excluding row padding; formats emitted by MetalTextureCache.
++  uint64_t bytes = 0, block = 1;
++  switch (format) {
++    case MTL::PixelFormatR8Unorm: case MTL::PixelFormatR8Snorm: bytes = 1; break;
++    case MTL::PixelFormatRG8Unorm: case MTL::PixelFormatRG8Snorm:
++    case MTL::PixelFormatR16Unorm: case MTL::PixelFormatR16Snorm:
++    case MTL::PixelFormatR16Float: case MTL::PixelFormatBGR5A1Unorm:
++    case MTL::PixelFormatB5G6R5Unorm: case MTL::PixelFormatABGR4Unorm: bytes = 2; break;
++    case MTL::PixelFormatRGBA8Unorm: case MTL::PixelFormatRGBA8Snorm:
++    case MTL::PixelFormatBGRA8Unorm: case MTL::PixelFormatRGB10A2Unorm:
++    case MTL::PixelFormatRG16Unorm: case MTL::PixelFormatRG16Snorm:
++    case MTL::PixelFormatRG16Float: case MTL::PixelFormatR32Float: bytes = 4; break;
++    case MTL::PixelFormatRGBA16Unorm: case MTL::PixelFormatRGBA16Snorm:
++    case MTL::PixelFormatRGBA16Float: case MTL::PixelFormatRG32Float: bytes = 8; break;
++    case MTL::PixelFormatRGBA32Float: bytes = 16; break;
++    case MTL::PixelFormatBC1_RGBA: case MTL::PixelFormatBC4_RUnorm:
++      bytes = 8; block = 4; break;
++    case MTL::PixelFormatBC2_RGBA: case MTL::PixelFormatBC3_RGBA:
++    case MTL::PixelFormatBC5_RGUnorm: bytes = 16; block = 4; break;
++    default: break;
++  }
++  return ((width + block - 1) / block) * ((height + block - 1) / block) * depth * bytes;
++}
++}  // namespace rex::ui::metal
 +#endif
 diff --git a/src/ui/metal/metal_util.h b/src/ui/metal/metal_util.h
 new file mode 100644
-index 0000000..8cccac8
+index 0000000..322d105
 --- /dev/null
 +++ b/src/ui/metal/metal_util.h
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,53 @@
 +#pragma once
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +
 +#include <memory>
++#include <string>
++#include <rex/cvar.h>
 +#include <Foundation/Foundation.hpp>
 +#include <Metal/Metal.hpp>
 +#include <rex/logging.h>
 +
++REXCVAR_DECLARE(bool, metal_gpu_labels);
++// Keep arguments (including formatting and texture queries) unevaluated when off.
++#define METAL_GPU_LABEL(call) do { \
++  if (REXCVAR_GET(metal_gpu_labels)) ::rex::ui::metal::call; \
++} while (false)
++
 +namespace rex::ui::metal {
++// Encoders are created, counted and ended on the same encoding thread.
++void GpuCommandBuffer(MTL::CommandBuffer* buffer, const char* role, uint64_t frame = 0);
++void GpuRender(MTL::RenderCommandEncoder* encoder, MTL::RenderPassDescriptor* pass,
++               const char* role);
++void GpuWork(MTL::CommandEncoder* encoder, std::string role, uint64_t count, const char* unit);
++void GpuCount(MTL::CommandEncoder* encoder, uint64_t count = 1);
++void GpuEnd(MTL::CommandEncoder* encoder);
++uint64_t GpuTextureBytes(MTL::PixelFormat format, uint64_t width, uint64_t height,
++                         uint64_t depth = 1);
++
 +struct ObjectReleaser {
 +  template <typename T>
 +  void operator()(T* object) const { if (object) object->release(); }
@@ -5753,10 +5946,10 @@ index 0000000..8cccac8
 +#endif
 diff --git a/src/ui/metal/presenter.mm b/src/ui/metal/presenter.mm
 new file mode 100644
-index 0000000..c6ce438
+index 0000000..72e321f
 --- /dev/null
 +++ b/src/ui/metal/presenter.mm
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,297 @@
 +#include <rex/ui/metal/presenter.h>
 +#if defined(__APPLE__) && defined(REX_HAS_METAL) && REX_HAS_METAL
 +
@@ -5823,6 +6016,8 @@ index 0000000..c6ce438
 +  color->setClearColor(MTL::ClearColor(red, green, blue, 1));
 +  auto* encoder = command_buffer_->renderCommandEncoder(pass);
 +  if (!encoder) return false;
++  METAL_GPU_LABEL(GpuRender(encoder, pass, "PRESENT|clear"));
++  METAL_GPU_LABEL(GpuEnd(encoder));
 +  encoder->endEncoding();
 +  SetIs8bpc(true);
 +  return Submit();
@@ -5914,6 +6109,7 @@ index 0000000..c6ce438
 +  }
 +  auto* buffer = provider_.queue()->commandBuffer();
 +  if (!buffer) return false;
++  METAL_GPU_LABEL(GpuCommandBuffer(buffer, "guest-output"));
 +  MetalGuestOutputRefreshContext context(is_8bpc_out, texture, buffer);
 +  bool refreshed = refresher(context);
 +  // Publish only after commit. Consumers commit on this same ordered queue
@@ -5936,10 +6132,13 @@ index 0000000..c6ce438
 +  auto staging = Adopt(provider_.device()->newBuffer(pitch * height, MTL::ResourceStorageModeShared));
 +  auto* buffer = provider_.queue()->commandBuffer();
 +  if (!staging || !buffer) return false;
++  METAL_GPU_LABEL(GpuCommandBuffer(buffer, "capture"));
 +  auto* blit = buffer->blitCommandEncoder();
 +  if (!blit) return false;
++  METAL_GPU_LABEL(GpuWork(blit, "BLT|capture", stride * height, "bytes"));
 +  blit->copyFromTexture(texture, 0, 0, MTL::Origin(0, 0, 0), MTL::Size(width, height, 1),
 +                        staging.get(), 0, pitch, pitch * height);
++  METAL_GPU_LABEL(GpuEnd(blit));
 +  blit->endEncoding();
 +  buffer->commit();
 +  if (!WaitForSubmission(buffer)) return false;
@@ -5978,6 +6177,7 @@ index 0000000..c6ce438
 +    auto lock = ConsumeGuestOutput(index, &properties, nullptr);
 +    auto* buffer = provider_.queue()->commandBuffer();
 +    if (!buffer) return PaintResult::kNotPresented;
++    METAL_GPU_LABEL(GpuCommandBuffer(buffer, "paint"));
 +    auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
 +    auto* color = pass->colorAttachments()->object(0);
 +    color->setTexture(target);
@@ -5986,6 +6186,7 @@ index 0000000..c6ce438
 +    color->setClearColor(MTL::ClearColor(0, 0, 0, 1));
 +    auto* encoder = buffer->renderCommandEncoder(pass);
 +    if (!encoder) return PaintResult::kNotPresented;
++    METAL_GPU_LABEL(GpuRender(encoder, pass, "PRESENT|paint"));
 +    if (index != UINT32_MAX && guest_textures_[index]) {
 +      auto texture = guest_drawer_->WrapTexture(guest_textures_[index]);
 +      float draw_width = float(width), draw_height = float(height);
@@ -6009,6 +6210,7 @@ index 0000000..c6ce438
 +      guest_drawer_->Draw(draw);
 +      guest_drawer_->End();
 +    }
++    METAL_GPU_LABEL(GpuEnd(encoder));
 +    encoder->endEncoding();
 +    if (!execute_ui_drawers) buffer->presentDrawable((__bridge MTL::Drawable*)drawable);
 +    ReportCompletion(buffer);
@@ -6025,11 +6227,14 @@ index 0000000..c6ce438
 +      // the guest sampling pass is already committed ahead of their work.
 +      buffer = provider_.queue()->commandBuffer();
 +      if (!buffer) return PaintResult::kNotPresented;
++      METAL_GPU_LABEL(GpuCommandBuffer(buffer, "ui"));
 +      color->setLoadAction(MTL::LoadActionLoad);
 +      encoder = buffer->renderCommandEncoder(pass);
 +      if (!encoder) return PaintResult::kNotPresented;
++      METAL_GPU_LABEL(GpuRender(encoder, pass, "PRESENT|ui"));
 +      MetalUIDrawContext context(*this, width, height, encoder);
 +      ExecuteUIDrawersFromUIThread(context);
++      METAL_GPU_LABEL(GpuEnd(encoder));
 +      encoder->endEncoding();
 +      buffer->presentDrawable((__bridge MTL::Drawable*)drawable);
 +      ReportCompletion(buffer);
